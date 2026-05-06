@@ -85,6 +85,13 @@ const (
 	ReasonNotAuthorized    byte = 0x87
 	ReasonQuotaExceeded    byte = 0x97
 
+	// MQTT v5 SUBACK reason codes (diagnostic; MQTT v3.1.1 uses 0x80 for any failure).
+	SubackGrantedQoS0            byte = 0x00
+	SubackGrantedQoS1            byte = 0x01
+	SubackGrantedQoS2            byte = 0x02
+	SubackImplementationSpecific byte = 0x83 // e.g. plugin hook rejection
+	SubackTopicFilterInvalid     byte = 0x8F
+
 	// MQTT v5 CONNACK reason codes used when mapping from v3.1.1 refusal codes or decode errors.
 	ConnackReasonV5MalformedPacket             byte = 0x81
 	ConnackReasonV5ProtocolError               byte = 0x82
@@ -93,6 +100,47 @@ const (
 	ConnackReasonV5BadUsernameOrPassword       byte = 0x86
 	ConnackReasonV5ServerUnavailable           byte = 0x88
 )
+
+// SubackDenyReason classifies why a subscription was not granted (MQTT v5 diagnostics).
+type SubackDenyReason byte
+
+const (
+	SubackOK SubackDenyReason = iota
+	SubackDeniedInvalidTopicFilter
+	SubackDeniedNotAuthorized
+	SubackDeniedPlugin
+)
+
+// Subv311SubackFailure is the single failure code allowed in MQTT v3.1.1 SUBACK payload.
+const Subv311SubackFailure byte = 0x80
+
+// SubackReasonByte returns one SUBACK return/reason byte for a subscription entry.
+// When deny != SubackOK, grantedQoS is ignored. For MQTT v3.1.1, any denial becomes 0x80.
+func SubackReasonByte(version byte, grantedQoS byte, deny SubackDenyReason) byte {
+	if deny != SubackOK {
+		if version != V50 {
+			return Subv311SubackFailure
+		}
+		switch deny {
+		case SubackDeniedInvalidTopicFilter:
+			return SubackTopicFilterInvalid
+		case SubackDeniedNotAuthorized:
+			return ReasonNotAuthorized
+		case SubackDeniedPlugin:
+			return SubackImplementationSpecific
+		default:
+			return ReasonUnspecifiedError
+		}
+	}
+	switch grantedQoS & 0x03 {
+	case 0:
+		return SubackGrantedQoS0
+	case 1:
+		return SubackGrantedQoS1
+	default:
+		return SubackGrantedQoS2
+	}
+}
 
 // ─── Limits ───────────────────────────────────────────────────────────────────
 

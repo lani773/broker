@@ -503,18 +503,21 @@ func (c *Client) handleSubscribe(body []byte) error {
 
 	codes := make([]byte, len(subs))
 	for i, sub := range subs {
+		qos := sub.QoS
 		aclFilter := sub.Filter
 		if _, inner, ok := protocol.ParseSharedTopicFilter(sub.Filter); ok {
 			aclFilter = inner
 		}
-		if !protocol.ValidTopicFilter(sub.Filter) || !c.broker.authn.CanSubscribe(c.clientID, aclFilter) {
-			codes[i] = 0x80
+		if !protocol.ValidTopicFilter(sub.Filter) {
+			codes[i] = protocol.SubackReasonByte(c.version, qos, protocol.SubackDeniedInvalidTopicFilter)
 			continue
 		}
-
-		qos := sub.QoS
+		if !c.broker.authn.CanSubscribe(c.clientID, aclFilter) {
+			codes[i] = protocol.SubackReasonByte(c.version, qos, protocol.SubackDeniedNotAuthorized)
+			continue
+		}
 		if err := c.broker.plugins.OnSubscribe(c.clientID, sub.Filter, qos); err != nil {
-			codes[i] = 0x80
+			codes[i] = protocol.SubackReasonByte(c.version, qos, protocol.SubackDeniedPlugin)
 			continue
 		}
 		c.broker.router.Subscribe(sub.Filter, &router.Subscriber{
@@ -526,7 +529,7 @@ func (c *Client) handleSubscribe(body []byte) error {
 		if !c.sess.CleanSession {
 			go c.broker.pg.SaveSub(context.Background(), c.clientID, sub.Filter, qos)
 		}
-		codes[i] = qos
+		codes[i] = protocol.SubackReasonByte(c.version, qos, protocol.SubackOK)
 
 		// Send retained messages that match this filter
 		go c.broker.router.SendRetained(sub.Filter, &router.Subscriber{

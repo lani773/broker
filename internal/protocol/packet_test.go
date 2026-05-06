@@ -118,6 +118,30 @@ func TestPeekConnectProtocolLevel(t *testing.T) {
 	}
 }
 
+func TestSubackReasonByteDiagnostics(t *testing.T) {
+	tests := []struct {
+		name   string
+		ver    byte
+		qos    byte
+		deny   SubackDenyReason
+		want   byte
+	}{
+		{"v5 qos1 ok", V50, 1, SubackOK, SubackGrantedQoS1},
+		{"v5 invalid filter", V50, 1, SubackDeniedInvalidTopicFilter, SubackTopicFilterInvalid},
+		{"v5 acl", V50, 2, SubackDeniedNotAuthorized, ReasonNotAuthorized},
+		{"v5 plugin", V50, 0, SubackDeniedPlugin, SubackImplementationSpecific},
+		{"v311 fail maps to 80", V311, 1, SubackDeniedNotAuthorized, Subv311SubackFailure},
+		{"v311 ok qos2", V311, 2, SubackOK, SubackGrantedQoS2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SubackReasonByte(tt.ver, tt.qos, tt.deny); got != tt.want {
+				t.Fatalf("want %#x got %#x", tt.want, got)
+			}
+		})
+	}
+}
+
 func TestConnackReasonV5ForDecodeError(t *testing.T) {
 	if got := ConnackReasonV5ForDecodeError(ErrUnsupportedVersion); got != ConnackReasonV5UnsupportedProtocolVersion {
 		t.Fatalf("unsupported version -> %#x", got)
