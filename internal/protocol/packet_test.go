@@ -118,6 +118,47 @@ func TestPeekConnectProtocolLevel(t *testing.T) {
 	}
 }
 
+func TestUnsubackReasonByteDiagnostics(t *testing.T) {
+	if got := UnsubackReasonByte(UnsubOK); got != UnsubackSuccessReason {
+		t.Fatalf("success want %#x got %#x", UnsubackSuccessReason, got)
+	}
+	if got := UnsubackReasonByte(UnsubDeniedInvalidTopicFilter); got != SubackTopicFilterInvalid {
+		t.Fatalf("invalid filter want %#x got %#x", SubackTopicFilterInvalid, got)
+	}
+	if got := UnsubackReasonByte(UnsubDeniedNotAuthorized); got != ReasonNotAuthorized {
+		t.Fatalf("not auth want %#x got %#x", ReasonNotAuthorized, got)
+	}
+}
+
+func TestEncodeUnsubackV5MatchesFilterOrder(t *testing.T) {
+	codes := []byte{UnsubackSuccessReason, SubackTopicFilterInvalid, ReasonNotAuthorized}
+	b := EncodeUnsubackV5(42, nil, codes)
+	br := bytes.NewReader(b)
+	fh, err := ReadFixed(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest := make([]byte, fh.RemainingLength)
+	if _, err := io.ReadFull(br, rest); err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) < 2+1+len(codes) {
+		t.Fatalf("short UNSUBACK body: %d", len(rest))
+	}
+	pid := uint16(rest[0])<<8 | uint16(rest[1])
+	if pid != 42 {
+		t.Fatalf("packet id %d", pid)
+	}
+	if rest[2] != 0 {
+		t.Fatalf("property length expected 0, got %d", rest[2])
+	}
+	for i := range codes {
+		if rest[3+i] != codes[i] {
+			t.Fatalf("reason[%d] %#x != %#x", i, rest[3+i], codes[i])
+		}
+	}
+}
+
 func TestSubackReasonByteDiagnostics(t *testing.T) {
 	tests := []struct {
 		name   string

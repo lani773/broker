@@ -554,7 +554,40 @@ func (c *Client) handleUnsubscribe(body []byte) error {
 	if err != nil {
 		return err
 	}
+
+	if c.version == protocol.V50 {
+		reasons := make([]byte, len(filters))
+		for i, f := range filters {
+			aclFilter := f
+			if _, inner, ok := protocol.ParseSharedTopicFilter(f); ok {
+				aclFilter = inner
+			}
+			var deny protocol.UnsubackDenyReason
+			switch {
+			case !protocol.ValidTopicFilter(f):
+				deny = protocol.UnsubDeniedInvalidTopicFilter
+			case !c.broker.authn.CanSubscribe(c.clientID, aclFilter):
+				deny = protocol.UnsubDeniedNotAuthorized
+			default:
+				c.broker.router.Unsubscribe(f, c.clientID)
+				if !c.sess.CleanSession {
+					go c.broker.pg.DeleteSub(context.Background(), c.clientID, f)
+				}
+			}
+			reasons[i] = protocol.UnsubackReasonByte(deny)
+		}
+		c.enqueue(protocol.EncodeUnsubackV5(packetID, nil, reasons))
+		return nil
+	}
+
 	for _, f := range filters {
+		aclFilter := f
+		if _, inner, ok := protocol.ParseSharedTopicFilter(f); ok {
+			aclFilter = inner
+		}
+		if !protocol.ValidTopicFilter(f) || !c.broker.authn.CanSubscribe(c.clientID, aclFilter) {
+			continue
+		}
 		c.broker.router.Unsubscribe(f, c.clientID)
 		if !c.sess.CleanSession {
 			go c.broker.pg.DeleteSub(context.Background(), c.clientID, f)

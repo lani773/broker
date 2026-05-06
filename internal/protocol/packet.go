@@ -142,6 +142,30 @@ func SubackReasonByte(version byte, grantedQoS byte, deny SubackDenyReason) byte
 	}
 }
 
+// UnsubackDenyReason classifies why an MQTT v5 UNSUBSCRIBE entry was not processed as success.
+type UnsubackDenyReason byte
+
+const (
+	UnsubOK UnsubackDenyReason = iota
+	UnsubDeniedInvalidTopicFilter
+	UnsubDeniedNotAuthorized
+)
+
+// UnsubackSuccessReason is the MQTT v5 UNSUBACK code when unsubscribe completes successfully (0x00).
+const UnsubackSuccessReason byte = 0x00
+
+// UnsubackReasonByte returns one MQTT v5 UNSUBACK reason byte per unsubscribed topic filter (MQTT v3.1.1 has no payload reasons).
+func UnsubackReasonByte(deny UnsubackDenyReason) byte {
+	switch deny {
+	case UnsubDeniedInvalidTopicFilter:
+		return SubackTopicFilterInvalid // 0x8F Topic Filter invalid
+	case UnsubDeniedNotAuthorized:
+		return ReasonNotAuthorized
+	default:
+		return UnsubackSuccessReason
+	}
+}
+
 // ─── Limits ───────────────────────────────────────────────────────────────────
 
 const (
