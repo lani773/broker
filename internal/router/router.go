@@ -12,12 +12,14 @@ package router
 
 import (
 	"hash/fnv"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/luma/broker/internal/metrics"
+	"github.com/luma/broker/internal/protocol"
 	"go.uber.org/zap"
 )
 
@@ -226,11 +228,23 @@ func collectFilters(n *node, prefix string, clientID string, out *[]string) {
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
+// sharedGroup is one MQTT v5 shared subscription group ($share/name/filter).
+type sharedGroup struct {
+	shareName   string
+	topicFilter string
+	mu          sync.Mutex
+	subs        map[string]*Subscriber
+	rr          atomic.Uint64
+}
+
 // Router is the central publish-subscribe engine.
 // It manages topic subscriptions, retained messages, and message delivery.
 type Router struct {
 	shards   [numShards]*shard
 	retained sync.Map // topic(string) → *Retained
+
+	sharedMu sync.RWMutex
+	shared   map[string]*sharedGroup // key: shareName + "\x00" + topicFilter
 
 	retainedCount atomic.Int64
 	logger        *zap.Logger
@@ -238,11 +252,26 @@ type Router struct {
 
 // New creates a Router with all shards initialized.
 func New(logger *zap.Logger) *Router {
-	r := &Router{logger: logger}
+	r := &Router{
+		logger: logger,
+		shared: make(map[string]*sharedGroup),
+	}
 	for i := range r.shards {
 		r.shards[i] = newShard()
 	}
 	return r
+}
+
+func sharedStoreKey(shareName, topicFilter string) string {
+	return shareName + "\x00" + topicFilter
+}
+
+func sharedKeyToFilter(key string) string {
+	i := strings.IndexByte(key, 0)
+	if i < 0 {
+		return ""
+	}
+	return "$share/" + key[:i] + "/" + key[i+1:]
 }
 
 // shardFor picks a shard based on the first segment of the filter/topic.
@@ -259,16 +288,64 @@ func (r *Router) shardFor(filter string) *shard {
 
 // Subscribe registers a subscription in the trie.
 func (r *Router) Subscribe(filter string, sub *Subscriber) {
+	if shareName, topicFilter, ok := protocol.ParseSharedTopicFilter(filter); ok {
+		r.subscribeShared(shareName, topicFilter, sub)
+		metrics.ActiveSubscriptions.Inc()
+		metrics.SubscribeTotal.Inc()
+		return
+	}
 	segs := splitFilter(filter)
 	r.shardFor(filter).subscribe(segs, sub)
 	metrics.ActiveSubscriptions.Inc()
 	metrics.SubscribeTotal.Inc()
 }
 
+func (r *Router) subscribeShared(shareName, topicFilter string, sub *Subscriber) {
+	key := sharedStoreKey(shareName, topicFilter)
+	r.sharedMu.Lock()
+	g := r.shared[key]
+	if g == nil {
+		g = &sharedGroup{
+			shareName:   shareName,
+			topicFilter: topicFilter,
+			subs:        make(map[string]*Subscriber),
+		}
+		r.shared[key] = g
+	}
+	r.sharedMu.Unlock()
+
+	g.mu.Lock()
+	g.subs[sub.ClientID] = sub
+	g.mu.Unlock()
+}
+
 // Unsubscribe removes a single client subscription.
 func (r *Router) Unsubscribe(filter, clientID string) {
+	if shareName, topicFilter, ok := protocol.ParseSharedTopicFilter(filter); ok {
+		r.unsubscribeShared(shareName, topicFilter, clientID)
+		return
+	}
 	segs := splitFilter(filter)
 	r.shardFor(filter).unsubscribe(segs, clientID)
+	metrics.ActiveSubscriptions.Dec()
+}
+
+func (r *Router) unsubscribeShared(shareName, topicFilter, clientID string) {
+	key := sharedStoreKey(shareName, topicFilter)
+	r.sharedMu.Lock()
+	g := r.shared[key]
+	if g == nil {
+		r.sharedMu.Unlock()
+		return
+	}
+	g.mu.Lock()
+	delete(g.subs, clientID)
+	empty := len(g.subs) == 0
+	g.mu.Unlock()
+	if empty {
+		delete(r.shared, key)
+	}
+	r.sharedMu.Unlock()
 	metrics.ActiveSubscriptions.Dec()
 }
 
@@ -277,6 +354,29 @@ func (r *Router) UnsubscribeAll(clientID string) {
 	for _, sh := range r.shards {
 		removeClientFromNode(sh.root, clientID)
 	}
+	n := r.removeClientFromAllShared(clientID)
+	for i := 0; i < n; i++ {
+		metrics.ActiveSubscriptions.Dec()
+	}
+}
+
+func (r *Router) removeClientFromAllShared(clientID string) int {
+	removed := 0
+	r.sharedMu.Lock()
+	for key, g := range r.shared {
+		g.mu.Lock()
+		if _, ok := g.subs[clientID]; ok {
+			delete(g.subs, clientID)
+			removed++
+		}
+		empty := len(g.subs) == 0
+		g.mu.Unlock()
+		if empty {
+			delete(r.shared, key)
+		}
+	}
+	r.sharedMu.Unlock()
+	return removed
 }
 
 // GetFilters returns all topic filters a client is subscribed to.
@@ -285,6 +385,15 @@ func (r *Router) GetFilters(clientID string) []string {
 	for _, sh := range r.shards {
 		collectFilters(sh.root, "", clientID, &filters)
 	}
+	r.sharedMu.RLock()
+	for key, g := range r.shared {
+		g.mu.Lock()
+		if _, ok := g.subs[clientID]; ok {
+			filters = append(filters, sharedKeyToFilter(key))
+		}
+		g.mu.Unlock()
+	}
+	r.sharedMu.RUnlock()
 	return filters
 }
 
@@ -311,11 +420,8 @@ func (r *Router) Publish(topic string, payload []byte, qos byte, retain bool) in
 		}
 	}
 
-	// Match subscribers
+	// Match subscribers (trie + shared subscriptions are handled separately).
 	matched := r.matchSubscribers(topic)
-	if len(matched) == 0 {
-		return 0
-	}
 
 	// Deliver to each subscriber
 	delivered := 0
@@ -330,8 +436,56 @@ func (r *Router) Publish(topic string, payload []byte, qos byte, retain bool) in
 		}
 	}
 
+	delivered += r.deliverShared(topic, payload, qos)
+
 	metrics.DeliveredTotal.Add(float64(delivered))
 	return delivered
+}
+
+func (r *Router) deliverShared(topic string, payload []byte, qos byte) int {
+	n := 0
+	r.sharedMu.RLock()
+	keys := make([]string, 0, len(r.shared))
+	for k := range r.shared {
+		keys = append(keys, k)
+	}
+	r.sharedMu.RUnlock()
+
+	for _, k := range keys {
+		r.sharedMu.RLock()
+		g := r.shared[k]
+		r.sharedMu.RUnlock()
+		if g == nil {
+			continue
+		}
+		if !TopicMatchesFilter(topic, g.topicFilter) {
+			continue
+		}
+		g.mu.Lock()
+		if len(g.subs) == 0 {
+			g.mu.Unlock()
+			continue
+		}
+		ids := make([]string, 0, len(g.subs))
+		for id := range g.subs {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		next := g.rr.Add(1)
+		idx := int((next - 1) % uint64(len(ids)))
+		sub := g.subs[ids[idx]]
+		g.mu.Unlock()
+
+		effQoS := qos
+		if sub.QoS < effQoS {
+			effQoS = sub.QoS
+		}
+		if sub.Deliver != nil {
+			sub.Deliver(topic, payload, effQoS, false, 0)
+			n++
+		}
+	}
+	return n
 }
 
 // matchSubscribers returns matched subscribers by splitting across all relevant shards.
@@ -349,10 +503,14 @@ func (r *Router) matchSubscribers(topic string) map[string]*Subscriber {
 
 // SendRetained delivers retained messages matching a filter to a new subscriber.
 func (r *Router) SendRetained(filter string, sub *Subscriber) {
+	matchFilter := filter
+	if _, inner, ok := protocol.ParseSharedTopicFilter(filter); ok {
+		matchFilter = inner
+	}
 	r.retained.Range(func(key, value any) bool {
 		topic := key.(string)
 		msg := value.(*Retained)
-		if TopicMatchesFilter(topic, filter) {
+		if TopicMatchesFilter(topic, matchFilter) {
 			effQoS := msg.QoS
 			if sub.QoS < effQoS {
 				effQoS = sub.QoS

@@ -28,3 +28,19 @@ func TestDecodePublishV5Properties(t *testing.T) {
 		t.Fatalf("payload mismatch: %q", string(pkt.Payload))
 	}
 }
+
+func TestParseSharedTopicFilter(t *testing.T) {
+	sn, inner, ok := ParseSharedTopicFilter("$share/grp/devices/+")
+	if !ok || sn != "grp" || inner != "devices/+" {
+		t.Fatalf("parse: ok=%v sn=%q inner=%q", ok, sn, inner)
+	}
+	if _, _, ok := ParseSharedTopicFilter("devices/+"); ok {
+		t.Fatal("non-shared should fail")
+	}
+	if ValidTopicFilter("$share//a") {
+		t.Fatal("empty share name invalid")
+	}
+	if !ValidTopicFilter("$share/g1/home/#") {
+		t.Fatal("valid shared filter")
+	}
+}

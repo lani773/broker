@@ -21,6 +21,7 @@ const (
 	keyClients     = "luma:clients"
 	keyRetained    = "luma:retained"
 	keyBrokerMeta  = "luma:broker"
+	keyBrokerPulse = "luma:broker:pulse" // ZSET: member=brokerID, score=last heartbeat unix ms
 	chanBroker     = "luma:cluster:messages"
 	chanAPIPublish = "luma:api:publish"
 	chanAdminCmd   = "luma:admin:cmd"
@@ -245,6 +246,32 @@ func (r *Redis) SetBrokerMeta(ctx context.Context, brokerID string, meta map[str
 // BrokerIDs lists broker instance IDs registered under broker metadata hash.
 func (r *Redis) BrokerIDs(ctx context.Context) ([]string, error) {
 	return r.c.HKeys(ctx, keyBrokerMeta).Result()
+}
+
+// BrokerPulse records this broker's liveness for partition assignment (cluster mode).
+func (r *Redis) BrokerPulse(ctx context.Context, brokerID string) error {
+	return r.c.ZAdd(ctx, keyBrokerPulse, redis.Z{
+		Score:  float64(time.Now().UnixMilli()),
+		Member: brokerID,
+	}).Err()
+}
+
+// AliveBrokerIDsAfterPrune removes pulse entries older than stale and returns remaining broker IDs.
+func (r *Redis) AliveBrokerIDsAfterPrune(ctx context.Context, stale time.Duration) ([]string, error) {
+	cutoff := time.Now().Add(-stale).UnixMilli()
+	if err := r.c.ZRemRangeByScore(ctx, keyBrokerPulse, "-inf", fmt.Sprintf("%d", cutoff)).Err(); err != nil {
+		return nil, err
+	}
+	return r.c.ZRange(ctx, keyBrokerPulse, 0, -1).Result()
+}
+
+// BrokerLeave removes this broker from the pulse ZSET and metadata hash (best-effort shutdown).
+func (r *Redis) BrokerLeave(ctx context.Context, brokerID string) error {
+	pipe := r.c.Pipeline()
+	pipe.ZRem(ctx, keyBrokerPulse, brokerID)
+	pipe.HDel(ctx, keyBrokerMeta, brokerID)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 // Close shuts down the Redis connection.

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 	"sync"
 	"time"
 )
@@ -615,12 +616,34 @@ func ValidTopicName(t string) bool {
 	return true
 }
 
-// ValidTopicFilter validates a SUBSCRIBE topic filter (wildcards allowed).
-func ValidTopicFilter(f string) bool {
-	if len(f) == 0 || len(f) > MaxTopicLen {
-		return false
+// ParseSharedTopicFilter parses MQTT v5 shared subscription "$share/{ShareName}/{TopicFilter}".
+func ParseSharedTopicFilter(f string) (shareName, topicFilter string, ok bool) {
+	const p = "$share/"
+	if len(f) <= len(p)+1 || !strings.HasPrefix(f, p) {
+		return "", "", false
 	}
-	segs := splitFilter(f)
+	rest := f[len(p):]
+	i := strings.IndexByte(rest, '/')
+	if i <= 0 || i >= len(rest)-1 {
+		return "", "", false
+	}
+	shareName = rest[:i]
+	topicFilter = rest[i+1:]
+	if shareName == "" || topicFilter == "" {
+		return "", "", false
+	}
+	for _, c := range shareName {
+		if c == '+' || c == '#' || c == '/' || c == 0 {
+			return "", "", false
+		}
+	}
+	if strings.HasPrefix(topicFilter, "$share/") {
+		return "", "", false
+	}
+	return shareName, topicFilter, true
+}
+
+func validTopicFilterSegments(segs []string) bool {
 	for i, seg := range segs {
 		switch seg {
 		case "#":
@@ -628,7 +651,7 @@ func ValidTopicFilter(f string) bool {
 				return false
 			}
 		case "+":
-			// valid single-level wildcard
+			// single-level wildcard
 		default:
 			for j := 0; j < len(seg); j++ {
 				if seg[j] == '+' || seg[j] == '#' || seg[j] == 0 {
@@ -638,6 +661,20 @@ func ValidTopicFilter(f string) bool {
 		}
 	}
 	return true
+}
+
+// ValidTopicFilter validates a SUBSCRIBE topic filter (wildcards allowed; MQTT v5 $share supported).
+func ValidTopicFilter(f string) bool {
+	if len(f) == 0 || len(f) > MaxTopicLen {
+		return false
+	}
+	if strings.HasPrefix(f, "$share/") {
+		if _, inner, ok := ParseSharedTopicFilter(f); ok {
+			return validTopicFilterSegments(splitFilter(inner))
+		}
+		return false
+	}
+	return validTopicFilterSegments(splitFilter(f))
 }
 
 func splitFilter(f string) []string {

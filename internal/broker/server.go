@@ -152,6 +152,11 @@ func (b *Broker) Start() error {
 
 	// Cluster fan-out
 	if b.cfg.Cluster.Enabled {
+		pulseCtx, pulseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = b.redis.BrokerPulse(pulseCtx, b.id)
+		pulseCancel()
+		b.wg.Add(1)
+		go b.clusterHeartbeatLoop()
 		b.wg.Add(1)
 		go b.partitionSyncLoop()
 		b.wg.Add(1)
@@ -193,6 +198,10 @@ func (b *Broker) Stop() {
 	case <-time.After(15 * time.Second):
 		b.logger.Warn("shutdown timeout")
 	}
+
+	leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_ = b.redis.BrokerLeave(leaveCtx, b.id)
+	leaveCancel()
 
 	b.redis.Close()
 	b.pg.Close()
@@ -345,6 +354,22 @@ func (b *Broker) publishSys() {
 	}
 }
 
+func (b *Broker) clusterHeartbeatLoop() {
+	defer b.wg.Done()
+	t := time.NewTicker(b.cfg.Cluster.BrokerHeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-t.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = b.redis.BrokerPulse(ctx, b.id)
+			cancel()
+		}
+	}
+}
+
 func (b *Broker) partitionSyncLoop() {
 	defer b.wg.Done()
 	t := time.NewTicker(b.cfg.Cluster.PartitionSyncInterval)
@@ -362,7 +387,7 @@ func (b *Broker) partitionSyncLoop() {
 func (b *Broker) reconcilePartitions() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ids, err := b.redis.BrokerIDs(ctx)
+	ids, err := b.redis.AliveBrokerIDsAfterPrune(ctx, b.cfg.Cluster.BrokerStaleAfter)
 	if err != nil || len(ids) == 0 {
 		for p := 0; p < b.cfg.Cluster.PartitionCount; p++ {
 			b.partitions.SetOwner(p, b.id)

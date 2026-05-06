@@ -100,6 +100,10 @@ type ClusterConfig struct {
 	PartitionReplica int
 	// PartitionSyncInterval controls how often partition ownership is recomputed from Redis broker registry.
 	PartitionSyncInterval time.Duration
+	// BrokerHeartbeatInterval is how often this node refreshes its liveness in Redis (cluster mode).
+	BrokerHeartbeatInterval time.Duration
+	// BrokerStaleAfter: brokers not heartbeating within this window are excluded from partition assignment.
+	BrokerStaleAfter time.Duration
 }
 
 type SLOConfig struct {
@@ -188,11 +192,13 @@ func Load() *Config {
 			RevokedCerts:   envCSV("TLS_REVOKED_SERIALS", nil),
 		},
 		Cluster: ClusterConfig{
-			Enabled:               envBool("CLUSTER_MODE", false),
-			BrokerID:              env("BROKER_ID", ""),
-			PartitionCount:        envInt("CLUSTER_PARTITIONS", 128),
-			PartitionReplica:      envInt("CLUSTER_REPLICAS", 3),
-			PartitionSyncInterval: envDuration("CLUSTER_PARTITION_SYNC_INTERVAL", 10*time.Second),
+			Enabled:                 envBool("CLUSTER_MODE", false),
+			BrokerID:                env("BROKER_ID", ""),
+			PartitionCount:          envInt("CLUSTER_PARTITIONS", 128),
+			PartitionReplica:        envInt("CLUSTER_REPLICAS", 3),
+			PartitionSyncInterval:   envDuration("CLUSTER_PARTITION_SYNC_INTERVAL", 10*time.Second),
+			BrokerHeartbeatInterval: envDuration("CLUSTER_BROKER_HEARTBEAT_INTERVAL", 5*time.Second),
+			BrokerStaleAfter:        envDuration("CLUSTER_BROKER_STALE_AFTER", 30*time.Second),
 		},
 		SLO: SLOConfig{
 			TargetMessagesPerSecond: int64(envInt("SLO_TARGET_MESSAGES_PER_SEC", 1000000)),
@@ -230,6 +236,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Cluster.PartitionSyncInterval <= 0 {
 		return fmt.Errorf("CLUSTER_PARTITION_SYNC_INTERVAL must be positive")
+	}
+	if c.Cluster.BrokerHeartbeatInterval <= 0 {
+		return fmt.Errorf("CLUSTER_BROKER_HEARTBEAT_INTERVAL must be positive")
+	}
+	if c.Cluster.BrokerStaleAfter <= 0 {
+		return fmt.Errorf("CLUSTER_BROKER_STALE_AFTER must be positive")
+	}
+	if c.Cluster.BrokerStaleAfter < 2*c.Cluster.BrokerHeartbeatInterval {
+		return fmt.Errorf("CLUSTER_BROKER_STALE_AFTER must be at least 2× CLUSTER_BROKER_HEARTBEAT_INTERVAL")
 	}
 	if c.Broker.MaxPacketSize < 128 {
 		return fmt.Errorf("MAX_PACKET_SIZE too small")

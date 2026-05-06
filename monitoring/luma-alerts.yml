@@ -1,0 +1,30 @@
+# Prometheus alerting rules for LUMA broker (tune thresholds per environment).
+groups:
+  - name: luma_broker
+    interval: 30s
+    rules:
+      - alert: LumaBrokerSLOViolation
+        expr: rate(luma_sre_slo_violations_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LUMA SLO violation counter increasing"
+          description: "Check /ready, logs, and load. rate={{ $value }}"
+
+      - alert: LumaBrokerHighDropRate
+        expr: rate(luma_broker_dropped_total[5m]) > 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Broker dropping messages or connections"
+          description: "Inspect reason label on luma_broker_dropped_total"
+
+      - alert: LumaBrokerAuthFailures
+        expr: rate(luma_broker_auth_failures_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated MQTT authentication failures"

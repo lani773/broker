@@ -440,7 +440,11 @@ func (c *Client) handleSubscribe(body []byte) error {
 
 	codes := make([]byte, len(subs))
 	for i, sub := range subs {
-		if !protocol.ValidTopicFilter(sub.Filter) || !c.broker.authn.CanSubscribe(c.clientID, sub.Filter) {
+		aclFilter := sub.Filter
+		if _, inner, ok := protocol.ParseSharedTopicFilter(sub.Filter); ok {
+			aclFilter = inner
+		}
+		if !protocol.ValidTopicFilter(sub.Filter) || !c.broker.authn.CanSubscribe(c.clientID, aclFilter) {
 			codes[i] = 0x80
 			continue
 		}
