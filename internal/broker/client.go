@@ -251,11 +251,11 @@ func (c *Client) handleConnect(body []byte) error {
 	c.sess = sess
 
 	if pkt.WillFlag {
-		sess.WillTopic   = pkt.WillTopic
+		sess.WillTopic = pkt.WillTopic
 		sess.WillPayload = pkt.WillPayload
-		sess.WillQoS     = pkt.WillQoS
-		sess.WillRetain  = pkt.WillRetain
-		sess.WillSet     = true
+		sess.WillQoS = pkt.WillQoS
+		sess.WillRetain = pkt.WillRetain
+		sess.WillSet = true
 	}
 
 	if pkt.KeepAlive > 0 {
@@ -372,13 +372,14 @@ func (c *Client) handlePublish(fh protocol.FixedHeader, body []byte) error {
 		if c.broker.cfg.Cluster.Enabled {
 			part := c.broker.partitions.PartitionForTopic(pkt.Topic)
 			c.broker.redis.PublishCluster(ctx, &storage.ClusterMsg{
-				SourceBroker: c.broker.id,
-				Partition:    part,
-				Sequence:     c.broker.clusterSeq.Add(1),
-				Topic:        pkt.Topic,
-				Payload:      pkt.Payload,
-				QoS:          pkt.QoS,
-				Retain:       pkt.Retain,
+				Ver:           1,
+				SourceBroker:  c.broker.id,
+				Partition:     part,
+				Sequence:      c.broker.clusterSeq.Add(1),
+				Topic:         pkt.Topic,
+				Payload:       pkt.Payload,
+				QoS:           pkt.QoS,
+				Retain:        pkt.Retain,
 				TimestampUnix: time.Now().Unix(),
 			})
 		}

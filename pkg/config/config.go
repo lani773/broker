@@ -25,19 +25,21 @@ type Config struct {
 }
 
 type BrokerConfig struct {
-	TCPAddr        string        // default ":1883"
-	TLSAddr        string        // default ":8883"
-	WSAddr         string        // MQTT-over-WebSocket listener, default ":8083"
-	QUICAddr       string        // MQTT-over-QUIC listener, default ":1884"
-	EnableWS       bool
-	EnableQUIC     bool
-	MaxConnections int           // default 50000
-	ReadBufSize    int           // default 32768 bytes
-	WriteBufSize   int           // default 32768 bytes
-	WriteQueueSize int           // default 512
-	MaxPacketSize  int           // default 10 MB
-	SysInterval    time.Duration // $SYS publish interval
-	PingGrace      float64       // multiplier on keepalive before timeout (1.5)
+	TCPAddr    string // default ":1883"
+	TLSAddr    string // default ":8883"
+	WSAddr     string // MQTT-over-WebSocket listener, default ":8083"
+	QUICAddr   string // MQTT-over-QUIC listener, default ":1884"
+	EnableWS   bool
+	EnableQUIC bool
+	// MQTTWSAllowedOrigins limits browser WebSocket Origin for /mqtt when not "*".
+	MQTTWSAllowedOrigins []string
+	MaxConnections       int           // default 50000
+	ReadBufSize          int           // default 32768 bytes
+	WriteBufSize         int           // default 32768 bytes
+	WriteQueueSize       int           // default 512
+	MaxPacketSize        int           // default 10 MB
+	SysInterval          time.Duration // $SYS publish interval
+	PingGrace            float64       // multiplier on keepalive before timeout (1.5)
 }
 
 type APIConfig struct {
@@ -64,12 +66,12 @@ type RedisConfig struct {
 }
 
 type PostgresConfig struct {
-	DSN          string
-	MaxConns     int32
-	MinConns     int32
-	MaxLifetime  time.Duration
-	MaxIdleTime  time.Duration
-	ConnTimeout  time.Duration
+	DSN         string
+	MaxConns    int32
+	MinConns    int32
+	MaxLifetime time.Duration
+	MaxIdleTime time.Duration
+	ConnTimeout time.Duration
 }
 
 type AuthConfig struct {
@@ -92,10 +94,12 @@ type TLSConfig struct {
 }
 
 type ClusterConfig struct {
-	Enabled         bool
-	BrokerID        string
-	PartitionCount  int
+	Enabled          bool
+	BrokerID         string
+	PartitionCount   int
 	PartitionReplica int
+	// PartitionSyncInterval controls how often partition ownership is recomputed from Redis broker registry.
+	PartitionSyncInterval time.Duration
 }
 
 type SLOConfig struct {
@@ -122,19 +126,20 @@ type LogConfig struct {
 func Load() *Config {
 	return &Config{
 		Broker: BrokerConfig{
-			TCPAddr:        env("MQTT_TCP_ADDR", ":1883"),
-			TLSAddr:        env("MQTT_TLS_ADDR", ":8883"),
-			WSAddr:         env("MQTT_WS_ADDR", ":8083"),
-			QUICAddr:       env("MQTT_QUIC_ADDR", ":1884"),
-			EnableWS:       envBool("MQTT_WS_ENABLED", true),
-			EnableQUIC:     envBool("MQTT_QUIC_ENABLED", false),
-			MaxConnections: envInt("MAX_CONNECTIONS", 50000),
-			ReadBufSize:    envInt("READ_BUF_SIZE", 32768),
-			WriteBufSize:   envInt("WRITE_BUF_SIZE", 32768),
-			WriteQueueSize: envInt("WRITE_QUEUE_SIZE", 512),
-			MaxPacketSize:  envInt("MAX_PACKET_SIZE", 10*1024*1024),
-			SysInterval:    envDuration("SYS_INTERVAL", 10*time.Second),
-			PingGrace:      envFloat("PING_GRACE", 1.5),
+			TCPAddr:              env("MQTT_TCP_ADDR", ":1883"),
+			TLSAddr:              env("MQTT_TLS_ADDR", ":8883"),
+			WSAddr:               env("MQTT_WS_ADDR", ":8083"),
+			QUICAddr:             env("MQTT_QUIC_ADDR", ":1884"),
+			EnableWS:             envBool("MQTT_WS_ENABLED", true),
+			EnableQUIC:           envBool("MQTT_QUIC_ENABLED", false),
+			MQTTWSAllowedOrigins: envCSV("MQTT_WS_ALLOWED_ORIGINS", []string{"*"}),
+			MaxConnections:       envInt("MAX_CONNECTIONS", 50000),
+			ReadBufSize:          envInt("READ_BUF_SIZE", 32768),
+			WriteBufSize:         envInt("WRITE_BUF_SIZE", 32768),
+			WriteQueueSize:       envInt("WRITE_QUEUE_SIZE", 512),
+			MaxPacketSize:        envInt("MAX_PACKET_SIZE", 10*1024*1024),
+			SysInterval:          envDuration("SYS_INTERVAL", 10*time.Second),
+			PingGrace:            envFloat("PING_GRACE", 1.5),
 		},
 		API: APIConfig{
 			Addr:            env("API_ADDR", ":8080"),
@@ -183,10 +188,11 @@ func Load() *Config {
 			RevokedCerts:   envCSV("TLS_REVOKED_SERIALS", nil),
 		},
 		Cluster: ClusterConfig{
-			Enabled:          envBool("CLUSTER_MODE", false),
-			BrokerID:         env("BROKER_ID", ""),
-			PartitionCount:   envInt("CLUSTER_PARTITIONS", 128),
-			PartitionReplica: envInt("CLUSTER_REPLICAS", 3),
+			Enabled:               envBool("CLUSTER_MODE", false),
+			BrokerID:              env("BROKER_ID", ""),
+			PartitionCount:        envInt("CLUSTER_PARTITIONS", 128),
+			PartitionReplica:      envInt("CLUSTER_REPLICAS", 3),
+			PartitionSyncInterval: envDuration("CLUSTER_PARTITION_SYNC_INTERVAL", 10*time.Second),
 		},
 		SLO: SLOConfig{
 			TargetMessagesPerSecond: int64(envInt("SLO_TARGET_MESSAGES_PER_SEC", 1000000)),
@@ -221,6 +227,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Cluster.PartitionReplica <= 0 {
 		return fmt.Errorf("CLUSTER_REPLICAS must be positive")
+	}
+	if c.Cluster.PartitionSyncInterval <= 0 {
+		return fmt.Errorf("CLUSTER_PARTITION_SYNC_INTERVAL must be positive")
 	}
 	if c.Broker.MaxPacketSize < 128 {
 		return fmt.Errorf("MAX_PACKET_SIZE too small")

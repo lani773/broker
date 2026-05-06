@@ -3,25 +3,64 @@ package broker
 import (
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 )
 
-var mqttWSUpgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	CheckOrigin: func(*http.Request) bool {
-		return true
-	},
+func mqttWSCheckOrigin(allowed []string) func(*http.Request) bool {
+	return func(r *http.Request) bool {
+		if len(allowed) == 0 {
+			return false
+		}
+		for _, o := range allowed {
+			if o == "*" {
+				return true
+			}
+		}
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		for _, o := range allowed {
+			if o == origin {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func newMQTTWSUpgrader(allowedOrigins []string) websocket.Upgrader {
+	// Subprotocol order follows common MQTT-over-WebSocket stacks (v5 first).
+	return websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		Subprotocols: []string{
+			"mqttv5",
+			"mqtt",
+			"mqttv3.1",
+			"mqtt-v3.1",
+		},
+		CheckOrigin: mqttWSCheckOrigin(allowedOrigins),
+	}
 }
 
 func (b *Broker) wsAcceptLoop() {
 	defer b.wg.Done()
+	up := newMQTTWSUpgrader(b.cfg.Broker.MQTTWSAllowedOrigins)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mqtt", func(w http.ResponseWriter, r *http.Request) {
-		ws, err := mqttWSUpgrader.Upgrade(w, r, nil)
+		// Optional legacy path: tolerate clients that omit Sec-WebSocket-Protocol.
+		proto := r.Header.Get("Sec-WebSocket-Protocol")
+		if proto != "" && !strings.Contains(strings.ToLower(proto), "mqtt") {
+			b.logger.Debug("mqtt ws client subprotocol mismatch",
+				zap.String("proto", proto),
+				zap.String("remote", r.RemoteAddr))
+		}
+		ws, err := up.Upgrade(w, r, nil)
 		if err != nil {
 			b.logger.Warn("mqtt ws upgrade failed", zap.Error(err))
 			return
@@ -109,9 +148,12 @@ func (c *wsConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *wsConn) Close() error                       { return c.ws.Close() }
-func (c *wsConn) LocalAddr() net.Addr                { return c.ws.LocalAddr() }
-func (c *wsConn) RemoteAddr() net.Addr               { return c.ws.RemoteAddr() }
-func (c *wsConn) SetDeadline(t time.Time) error      { _ = c.ws.SetReadDeadline(t); return c.ws.SetWriteDeadline(t) }
+func (c *wsConn) Close() error         { return c.ws.Close() }
+func (c *wsConn) LocalAddr() net.Addr  { return c.ws.LocalAddr() }
+func (c *wsConn) RemoteAddr() net.Addr { return c.ws.RemoteAddr() }
+func (c *wsConn) SetDeadline(t time.Time) error {
+	_ = c.ws.SetReadDeadline(t)
+	return c.ws.SetWriteDeadline(t)
+}
 func (c *wsConn) SetReadDeadline(t time.Time) error  { return c.ws.SetReadDeadline(t) }
 func (c *wsConn) SetWriteDeadline(t time.Time) error { return c.ws.SetWriteDeadline(t) }

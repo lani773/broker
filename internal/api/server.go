@@ -95,33 +95,33 @@ func (s *Server) register(mux *http.ServeMux) {
 
 	// Auth
 	mux.HandleFunc("POST /auth/register", s.handleRegister)
-	mux.HandleFunc("POST /auth/login",    s.handleLogin)
-	mux.HandleFunc("GET /auth/me",        s.authed(s.handleMe))
-	mux.HandleFunc("POST /auth/refresh",  s.authed(s.handleRefresh))
+	mux.HandleFunc("POST /auth/login", s.handleLogin)
+	mux.HandleFunc("GET /auth/me", s.authed(s.handleMe))
+	mux.HandleFunc("POST /auth/refresh", s.authed(s.handleRefresh))
 
 	// Devices
-	mux.HandleFunc("POST /devices",          s.authed(s.handleDeviceCreate))
-	mux.HandleFunc("GET /devices",           s.authed(s.handleDeviceList))
-	mux.HandleFunc("GET /devices/{id}",      s.authed(s.handleDeviceGet))
-	mux.HandleFunc("DELETE /devices/{id}",   s.authed(s.handleDeviceDelete))
+	mux.HandleFunc("POST /devices", s.authed(s.handleDeviceCreate))
+	mux.HandleFunc("GET /devices", s.authed(s.handleDeviceList))
+	mux.HandleFunc("GET /devices/{id}", s.authed(s.handleDeviceGet))
+	mux.HandleFunc("DELETE /devices/{id}", s.authed(s.handleDeviceDelete))
 
 	// MQTT Control
-	mux.HandleFunc("POST /mqtt/publish",     s.authed(s.handlePublish))
-	mux.HandleFunc("POST /mqtt/subscribe",   s.authed(s.handleSubscribe))
-	mux.HandleFunc("GET /mqtt/messages",     s.authed(s.handleMessages))
-	mux.HandleFunc("GET /mqtt/retained",     s.authed(s.handleRetained))
+	mux.HandleFunc("POST /mqtt/publish", s.authed(s.handlePublish))
+	mux.HandleFunc("POST /mqtt/subscribe", s.authed(s.handleSubscribe))
+	mux.HandleFunc("GET /mqtt/messages", s.authed(s.handleMessages))
+	mux.HandleFunc("GET /mqtt/retained", s.authed(s.handleRetained))
 	mux.HandleFunc("DELETE /mqtt/retained/{topic...}", s.authed(s.handleRetainedDelete))
 
 	// Admin
-	mux.HandleFunc("GET /admin/stats",       s.authed(s.handleStats))
-	mux.HandleFunc("GET /admin/slo",         s.admin(s.handleSLO))
-	mux.HandleFunc("GET /admin/readiness",   s.admin(s.handleReadiness))
-	mux.HandleFunc("GET /admin/clients",     s.authed(s.handleClients))
-	mux.HandleFunc("GET /admin/logs",        s.admin(s.handleLogs))
-	mux.HandleFunc("POST /admin/acl",        s.admin(s.handleACLAdd))
+	mux.HandleFunc("GET /admin/stats", s.authed(s.handleStats))
+	mux.HandleFunc("GET /admin/slo", s.admin(s.handleSLO))
+	mux.HandleFunc("GET /admin/readiness", s.admin(s.handleReadiness))
+	mux.HandleFunc("GET /admin/clients", s.authed(s.handleClients))
+	mux.HandleFunc("GET /admin/logs", s.admin(s.handleLogs))
+	mux.HandleFunc("POST /admin/acl", s.admin(s.handleACLAdd))
 	mux.HandleFunc("POST /admin/disconnect/{id}", s.admin(s.handleDisconnect))
-	mux.HandleFunc("POST /admin/ban",        s.admin(s.handleBan))
-	mux.HandleFunc("GET /admin/timeseries",  s.authed(s.handleTimeseries))
+	mux.HandleFunc("POST /admin/ban", s.admin(s.handleBan))
+	mux.HandleFunc("GET /admin/timeseries", s.authed(s.handleTimeseries))
 
 	// WebSocket
 	mux.HandleFunc("GET /ws", s.handleWebSocket)
@@ -170,10 +170,13 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 var apiRateLimiter = auth.NewRateLimiter(200, 400)
 
 func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
-	exempt := map[string]bool{"/health": true, "/metrics": true, "/": true}
+	exempt := map[string]bool{"/health": true, "/ready": true, "/metrics": true, "/": true}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !exempt[r.URL.Path] {
-			ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+			ip, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				ip = r.RemoteAddr
+			}
 			if !apiRateLimiter.Allow(ip) {
 				writeJSON(w, http.StatusTooManyRequests, errBody("rate_limit_exceeded", "Too many requests"))
 				return
@@ -249,7 +252,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	checks := map[string]string{}
-	code   := http.StatusOK
+	code := http.StatusOK
 
 	if _, err := s.pg.Pool().Exec(ctx, "SELECT 1"); err != nil {
 		checks["postgres"] = "error: " + err.Error()
@@ -279,21 +282,71 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
-	stats := s.broker.Stats(r.Context())
-	currMPS, _ := stats["messages_per_second"].(int64)
-	ok := currMPS <= s.cfg.SLO.TargetMessagesPerSecond
-	if !ok {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	checks := map[string]string{}
+	depsReady := true
+	if _, err := s.pg.Pool().Exec(ctx, "SELECT 1"); err != nil {
+		checks["postgres"] = "error: " + err.Error()
+		depsReady = false
+	} else {
+		checks["postgres"] = "ok"
+	}
+	if err := s.redis.Client().Ping(ctx).Err(); err != nil {
+		checks["redis"] = "error: " + err.Error()
+		depsReady = false
+	} else {
+		checks["redis"] = "ok"
+	}
+
+	stats := s.broker.Stats(ctx)
+	currMPS := int64FromAny(stats["messages_per_second"])
+	clusterConns := int64FromAny(stats["connected_clients"])
+
+	sloOK := depsReady &&
+		currMPS <= s.cfg.SLO.TargetMessagesPerSecond &&
+		(s.cfg.SLO.TargetConnPerCluster <= 0 || clusterConns <= s.cfg.SLO.TargetConnPerCluster)
+
+	if depsReady && currMPS > s.cfg.SLO.TargetMessagesPerSecond {
 		metrics.SLOViolationTotal.WithLabelValues("messages_per_second").Inc()
 	}
+	if depsReady && s.cfg.SLO.TargetConnPerCluster > 0 && clusterConns > s.cfg.SLO.TargetConnPerCluster {
+		metrics.SLOViolationTotal.WithLabelValues("connections_cluster").Inc()
+	}
+
 	code := http.StatusOK
-	if !ok {
+	if !depsReady || !sloOK {
 		code = http.StatusServiceUnavailable
 	}
 	writeJSON(w, code, map[string]interface{}{
-		"ready": ok,
-		"slo_target_mps": s.cfg.SLO.TargetMessagesPerSecond,
-		"current_mps": currMPS,
+		"ready":                          sloOK,
+		"dependencies_ok":                depsReady,
+		"slo_throughput_ok":              currMPS <= s.cfg.SLO.TargetMessagesPerSecond,
+		"slo_connections_ok":             s.cfg.SLO.TargetConnPerCluster <= 0 || clusterConns <= s.cfg.SLO.TargetConnPerCluster,
+		"checks":                         checks,
+		"slo_target_mps":                 s.cfg.SLO.TargetMessagesPerSecond,
+		"slo_target_cluster_connections": s.cfg.SLO.TargetConnPerCluster,
+		"current_mps":                    currMPS,
+		"cluster_connected_clients":      clusterConns,
 	})
+}
+
+func int64FromAny(v interface{}) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case int32:
+		return int64(x)
+	case uint64:
+		return int64(x)
+	case float64:
+		return int64(x)
+	default:
+		return 0
+	}
 }
 
 // ─── Auth Handlers ────────────────────────────────────────────────────────────
@@ -424,7 +477,7 @@ func (s *Server) handleDeviceCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeviceList(w http.ResponseWriter, r *http.Request) {
-	limit  := queryInt(r, "limit", 50)
+	limit := queryInt(r, "limit", 50)
 	offset := queryInt(r, "offset", 0)
 	devices, total, err := s.pg.GetDevices(r.Context(), limit, offset)
 	if err != nil {
@@ -522,8 +575,8 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	topic  := r.URL.Query().Get("topic")
-	limit  := queryInt(r, "limit", 50)
+	topic := r.URL.Query().Get("topic")
+	limit := queryInt(r, "limit", 50)
 	offset := queryInt(r, "offset", 0)
 
 	msgs, total, err := s.pg.GetMsgs(r.Context(), topic, limit, offset)
@@ -565,9 +618,9 @@ func (s *Server) handleSLO(w http.ResponseWriter, r *http.Request) {
 	stats := s.broker.Stats(r.Context())
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"targets": map[string]interface{}{
-			"messages_per_second": s.cfg.SLO.TargetMessagesPerSecond,
-			"p99_latency_ms":      s.cfg.SLO.TargetP99LatencyMs,
-			"connections_cluster": s.cfg.SLO.TargetConnPerCluster,
+			"messages_per_second":  s.cfg.SLO.TargetMessagesPerSecond,
+			"p99_latency_ms":       s.cfg.SLO.TargetP99LatencyMs,
+			"connections_cluster":  s.cfg.SLO.TargetConnPerCluster,
 			"failover_rto_seconds": s.cfg.SLO.FailoverRTOSeconds,
 			"failover_rpo_seconds": s.cfg.SLO.FailoverRPOSeconds,
 			"error_budget_percent": s.cfg.SLO.ErrorBudgetPercent,
@@ -652,9 +705,9 @@ func (s *Server) handleBan(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTimeseries(w http.ResponseWriter, r *http.Request) {
 	window := queryInt(r, "window", 60)
-	now    := time.Now().Unix()
-	pipe   := s.redis.Client().Pipeline()
-	ctx    := r.Context()
+	now := time.Now().Unix()
+	pipe := s.redis.Client().Pipeline()
+	ctx := r.Context()
 
 	cmds := make([]*interface{}, window)
 	_ = cmds
@@ -667,7 +720,7 @@ func (s *Server) handleTimeseries(w http.ResponseWriter, r *http.Request) {
 	results, _ := pipe.Exec(ctx)
 
 	series := make([]map[string]interface{}, window)
-	total  := int64(0)
+	total := int64(0)
 	for i, res := range results {
 		val := int64(0)
 		if res.Err() == nil {
@@ -687,10 +740,14 @@ func (s *Server) handleTimeseries(w http.ResponseWriter, r *http.Request) {
 
 // ─── WebSocket Hub ────────────────────────────────────────────────────────────
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin:     func(r *http.Request) bool { return true },
-	ReadBufferSize:  1024,
-	WriteBufferSize: 4096,
+func (s *Server) streamingWSUpgrader() *websocket.Upgrader {
+	return &websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return s.originAllowed(r.Header.Get("Origin"))
+		},
+		ReadBufferSize:  1024,
+		WriteBufferSize: 4096,
+	}
 }
 
 type wsClient struct {
@@ -764,7 +821,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
 	}
-	conn, err := upgrader.Upgrade(w, r, nil)
+	up := s.streamingWSUpgrader()
+	conn, err := up.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Warn("ws upgrade failed", zap.Error(err))
 		return
@@ -928,6 +986,9 @@ func (s *Server) originAllowed(origin string) bool {
 	allowed := s.cfg.API.AllowedOrigins
 	if len(allowed) == 0 {
 		return false
+	}
+	if origin == "" {
+		return true
 	}
 	for _, o := range allowed {
 		if o == "*" || o == origin {

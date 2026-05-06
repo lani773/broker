@@ -2,11 +2,12 @@ package broker
 
 import (
 	"context"
-	"crypto/x509"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
-	"os"
 	"net"
+	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -151,6 +152,8 @@ func (b *Broker) Start() error {
 
 	// Cluster fan-out
 	if b.cfg.Cluster.Enabled {
+		b.wg.Add(1)
+		go b.partitionSyncLoop()
 		b.wg.Add(1)
 		go b.clusterLoop()
 	}
@@ -327,18 +330,49 @@ func (b *Broker) sysLoop() {
 func (b *Broker) publishSys() {
 	ctx := context.Background()
 	cc, _ := b.redis.ClientCount(ctx)
-	rate  := b.redis.GetMsgRate(ctx)
+	rate := b.redis.GetMsgRate(ctx)
 	uptime := time.Since(b.startTime).Seconds()
 
 	pairs := [][2]string{
 		{"$SYS/broker/clients/connected", fmt.Sprintf("%d", cc)},
-		{"$SYS/broker/messages/rate",     fmt.Sprintf("%d", rate)},
-		{"$SYS/broker/uptime",            fmt.Sprintf("%.0f", uptime)},
-		{"$SYS/broker/version",           "LUMA/2.0.0-go"},
-		{"$SYS/broker/sessions",          fmt.Sprintf("%d", b.sessions.Count())},
+		{"$SYS/broker/messages/rate", fmt.Sprintf("%d", rate)},
+		{"$SYS/broker/uptime", fmt.Sprintf("%.0f", uptime)},
+		{"$SYS/broker/version", "LUMA/2.0.0-go"},
+		{"$SYS/broker/sessions", fmt.Sprintf("%d", b.sessions.Count())},
 	}
 	for _, p := range pairs {
 		b.router.Publish(p[0], []byte(p[1]), 0, true)
+	}
+}
+
+func (b *Broker) partitionSyncLoop() {
+	defer b.wg.Done()
+	t := time.NewTicker(b.cfg.Cluster.PartitionSyncInterval)
+	defer t.Stop()
+	for {
+		b.reconcilePartitions()
+		select {
+		case <-t.C:
+		case <-b.ctx.Done():
+			return
+		}
+	}
+}
+
+func (b *Broker) reconcilePartitions() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ids, err := b.redis.BrokerIDs(ctx)
+	if err != nil || len(ids) == 0 {
+		for p := 0; p < b.cfg.Cluster.PartitionCount; p++ {
+			b.partitions.SetOwner(p, b.id)
+		}
+		return
+	}
+	sort.Strings(ids)
+	n := len(ids)
+	for p := 0; p < b.cfg.Cluster.PartitionCount; p++ {
+		b.partitions.SetOwner(p, ids[p%n])
 	}
 }
 
@@ -349,8 +383,10 @@ func (b *Broker) clusterLoop() {
 		select {
 		case msg := <-ch:
 			if msg.SourceBroker != b.id {
-				if b.partitions.Owner(msg.Partition) != b.id {
-					continue
+				if msg.Ver >= 1 {
+					if b.partitions.Owner(msg.Partition) != b.id {
+						continue
+					}
 				}
 				b.router.Publish(msg.Topic, msg.Payload, msg.QoS, msg.Retain)
 			}
@@ -398,7 +434,7 @@ func (b *Broker) loadRetained() error {
 // Stats returns broker statistics for the API.
 func (b *Broker) Stats(ctx context.Context) map[string]interface{} {
 	cc, _ := b.redis.ClientCount(ctx)
-	rate  := b.redis.GetMsgRate(ctx)
+	rate := b.redis.GetMsgRate(ctx)
 	rStats := b.router.Stats()
 
 	b.mu.RLock()
@@ -406,14 +442,14 @@ func (b *Broker) Stats(ctx context.Context) map[string]interface{} {
 	b.mu.RUnlock()
 
 	return map[string]interface{}{
-		"broker_id":            b.id,
-		"uptime_seconds":       time.Since(b.startTime).Seconds(),
-		"connected_clients":    cc,
-		"local_clients":        localClients,
-		"total_connections":    b.totalConns.Load(),
-		"messages_per_second":  rate,
-		"sessions":             b.sessions.Count(),
-		"retained_messages":    rStats["retained_messages"],
+		"broker_id":           b.id,
+		"uptime_seconds":      time.Since(b.startTime).Seconds(),
+		"connected_clients":   cc,
+		"local_clients":       localClients,
+		"total_connections":   b.totalConns.Load(),
+		"messages_per_second": rate,
+		"sessions":            b.sessions.Count(),
+		"retained_messages":   rStats["retained_messages"],
 	}
 }
 

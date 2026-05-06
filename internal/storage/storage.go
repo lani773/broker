@@ -18,12 +18,12 @@ import (
 // ─── Redis ────────────────────────────────────────────────────────────────────
 
 const (
-	keyClients   = "luma:clients"
-	keyRetained  = "luma:retained"
-	keyBrokerMeta= "luma:broker"
-	chanBroker   = "luma:cluster:messages"
+	keyClients     = "luma:clients"
+	keyRetained    = "luma:retained"
+	keyBrokerMeta  = "luma:broker"
+	chanBroker     = "luma:cluster:messages"
 	chanAPIPublish = "luma:api:publish"
-	chanAdminCmd = "luma:admin:cmd"
+	chanAdminCmd   = "luma:admin:cmd"
 )
 
 // Redis wraps go-redis with domain-specific helpers.
@@ -154,14 +154,16 @@ func (r *Redis) GetMsgRate(ctx context.Context) int64 {
 
 // ClusterMsg is fan-out via Redis when cluster mode is enabled.
 type ClusterMsg struct {
-	SourceBroker string `json:"src"`
-	Partition    int    `json:"partition"`
-	Sequence     uint64 `json:"seq"`
-	Topic        string `json:"topic"`
-	Payload      []byte `json:"payload"`
-	QoS          byte   `json:"qos"`
-	Retain       bool   `json:"retain"`
-	TimestampUnix int64 `json:"ts"`
+	// Ver 0 = legacy (all brokers deliver). Ver >= 1 respects partition routing.
+	Ver           int    `json:"v,omitempty"`
+	SourceBroker  string `json:"src"`
+	Partition     int    `json:"partition"`
+	Sequence      uint64 `json:"seq"`
+	Topic         string `json:"topic"`
+	Payload       []byte `json:"payload"`
+	QoS           byte   `json:"qos"`
+	Retain        bool   `json:"retain"`
+	TimestampUnix int64  `json:"ts"`
 }
 
 func (r *Redis) PublishCluster(ctx context.Context, msg *ClusterMsg) error {
@@ -171,7 +173,7 @@ func (r *Redis) PublishCluster(ctx context.Context, msg *ClusterMsg) error {
 
 func (r *Redis) SubscribeCluster(ctx context.Context) <-chan *ClusterMsg {
 	sub := r.c.Subscribe(ctx, chanBroker)
-	ch  := make(chan *ClusterMsg, 512)
+	ch := make(chan *ClusterMsg, 512)
 	go func() {
 		defer sub.Close()
 		for m := range sub.Channel() {
@@ -202,7 +204,7 @@ type APIPublishMsg struct {
 
 func (r *Redis) SubscribeAPIPublish(ctx context.Context) <-chan *APIPublishMsg {
 	sub := r.c.Subscribe(ctx, chanAPIPublish)
-	ch  := make(chan *APIPublishMsg, 256)
+	ch := make(chan *APIPublishMsg, 256)
 	go func() {
 		defer sub.Close()
 		for m := range sub.Channel() {
@@ -240,6 +242,11 @@ func (r *Redis) SetBrokerMeta(ctx context.Context, brokerID string, meta map[str
 	return r.c.HSet(ctx, keyBrokerMeta, brokerID, data).Err()
 }
 
+// BrokerIDs lists broker instance IDs registered under broker metadata hash.
+func (r *Redis) BrokerIDs(ctx context.Context) ([]string, error) {
+	return r.c.HKeys(ctx, keyBrokerMeta).Result()
+}
+
 // Close shuts down the Redis connection.
 func (r *Redis) Close() error { return r.c.Close() }
 
@@ -260,10 +267,10 @@ func NewPostgres(cfg config.PostgresConfig, logger *zap.Logger) (*Postgres, erro
 	if err != nil {
 		return nil, fmt.Errorf("pgx parse config: %w", err)
 	}
-	poolCfg.MaxConns          = cfg.MaxConns
-	poolCfg.MinConns          = cfg.MinConns
-	poolCfg.MaxConnLifetime   = cfg.MaxLifetime
-	poolCfg.MaxConnIdleTime   = cfg.MaxIdleTime
+	poolCfg.MaxConns = cfg.MaxConns
+	poolCfg.MinConns = cfg.MinConns
+	poolCfg.MaxConnLifetime = cfg.MaxLifetime
+	poolCfg.MaxConnIdleTime = cfg.MaxIdleTime
 	poolCfg.ConnConfig.ConnectTimeout = cfg.ConnTimeout
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
