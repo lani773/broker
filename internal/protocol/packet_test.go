@@ -44,3 +44,28 @@ func TestParseSharedTopicFilter(t *testing.T) {
 		t.Fatal("valid shared filter")
 	}
 }
+
+func TestDecodePublishV5EmptyTopicUsesAlias(t *testing.T) {
+	// QoS0: topic "", properties: topic alias = 7 (0x23), payload "x"
+	body := []byte{
+		0x00, 0x00, // empty topic
+		0x03,       // props length
+		0x23, 0x00, 0x07,
+		'x',
+	}
+	fh := FixedHeader{Type: PUBLISH, Flags: 0, RemainingLength: len(body)}
+	pkt, err := DecodePublish(V50, fh, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Topic != "" || pkt.TopicAlias != 7 || string(pkt.Payload) != "x" {
+		t.Fatalf("got topic=%q alias=%d payload=%q", pkt.Topic, pkt.TopicAlias, pkt.Payload)
+	}
+}
+
+func TestEncodeConnackV5TopicAliasMax(t *testing.T) {
+	b := EncodeConnackV5(true, ConnAccepted, 64)
+	if len(b) < 8 {
+		t.Fatalf("CONNACK v5 too short: %d", len(b))
+	}
+}

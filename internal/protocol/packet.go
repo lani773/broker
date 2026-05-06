@@ -389,6 +389,31 @@ func EncodeConnack(sessionPresent bool, code byte) []byte {
 	return pkt[:]
 }
 
+// EncodeConnackV5 builds a MQTT v5 CONNACK with optional Topic Alias Maximum (0x22).
+func EncodeConnackV5(sessionPresent bool, reasonCode byte, topicAliasMax uint16) []byte {
+	flags := byte(0)
+	if sessionPresent {
+		flags = 0x01
+	}
+	var props []byte
+	if topicAliasMax > 0 {
+		props = append(props, 0x22, byte(topicAliasMax>>8), byte(topicAliasMax))
+	}
+	var propLenEnc [4]byte
+	nProp := encodeVarInt(propLenEnc[:], len(props))
+	rem := 2 + nProp + len(props)
+	var remEnc [4]byte
+	nRem := encodeVarInt(remEnc[:], rem)
+
+	out := make([]byte, 0, 1+nRem+rem)
+	out = append(out, byte(CONNACK)<<4, 0)
+	out = append(out, remEnc[:nRem]...)
+	out = append(out, flags, reasonCode)
+	out = append(out, propLenEnc[:nProp]...)
+	out = append(out, props...)
+	return out
+}
+
 // ─── PUBLISH ─────────────────────────────────────────────────────────────────
 
 // PublishPacket is a decoded MQTT PUBLISH packet.
@@ -426,8 +451,10 @@ func DecodePublish(version byte, fh FixedHeader, body []byte) (*PublishPacket, e
 	if err != nil {
 		return nil, fmt.Errorf("topic: %w", err)
 	}
-	if !ValidTopicName(pkt.Topic) {
-		return nil, ErrInvalidTopic
+	if version != V50 || pkt.Topic != "" {
+		if !ValidTopicName(pkt.Topic) {
+			return nil, ErrInvalidTopic
+		}
 	}
 
 	if pkt.QoS > QoS0 {
@@ -450,6 +477,9 @@ func DecodePublish(version byte, fh FixedHeader, body []byte) (*PublishPacket, e
 		}
 		if v, ok := props[0x23]; ok && len(v) == 2 {
 			pkt.TopicAlias = binary.BigEndian.Uint16(v)
+		}
+		if pkt.Topic == "" && pkt.TopicAlias == 0 {
+			return nil, ErrProtocolViolation
 		}
 	}
 

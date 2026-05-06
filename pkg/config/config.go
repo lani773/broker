@@ -40,6 +40,8 @@ type BrokerConfig struct {
 	MaxPacketSize        int           // default 10 MB
 	SysInterval          time.Duration // $SYS publish interval
 	PingGrace            float64       // multiplier on keepalive before timeout (1.5)
+	// TopicAliasMax is the MQTT v5 Topic Alias Maximum sent in CONNACK (0 = disable client aliases).
+	TopicAliasMax int
 }
 
 type APIConfig struct {
@@ -144,6 +146,7 @@ func Load() *Config {
 			MaxPacketSize:        envInt("MAX_PACKET_SIZE", 10*1024*1024),
 			SysInterval:          envDuration("SYS_INTERVAL", 10*time.Second),
 			PingGrace:            envFloat("PING_GRACE", 1.5),
+			TopicAliasMax:        envInt("MQTT_TOPIC_ALIAS_MAX", 64),
 		},
 		API: APIConfig{
 			Addr:            env("API_ADDR", ":8080"),
@@ -248,6 +251,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Broker.MaxPacketSize < 128 {
 		return fmt.Errorf("MAX_PACKET_SIZE too small")
+	}
+	if c.Broker.TopicAliasMax < 0 || c.Broker.TopicAliasMax > 65535 {
+		return fmt.Errorf("MQTT_TOPIC_ALIAS_MAX must be between 0 and 65535")
 	}
 	return nil
 }

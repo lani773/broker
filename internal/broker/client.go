@@ -66,6 +66,10 @@ type Client struct {
 	// Keep-alive deadline tracking
 	keepAlive time.Duration
 
+	// MQTT v5 incoming topic aliases (publisher → broker)
+	topicAliasMu sync.RWMutex
+	topicAliases map[uint16]string
+
 	// Metrics
 	rxPackets atomic.Uint64
 	txPackets atomic.Uint64
@@ -295,7 +299,11 @@ func (c *Client) handleConnect(body []byte) error {
 		zap.Bool("present", present),
 	)
 
-	c.enqueue(protocol.EncodeConnack(present, protocol.ConnAccepted))
+	if c.version == protocol.V50 {
+		c.enqueue(protocol.EncodeConnackV5(present, protocol.ConnAccepted, uint16(c.broker.cfg.Broker.TopicAliasMax)))
+	} else {
+		c.enqueue(protocol.EncodeConnack(present, protocol.ConnAccepted))
+	}
 
 	// Restore persistent session subscriptions
 	if present && !pkt.CleanSession {
@@ -308,6 +316,38 @@ func (c *Client) handleConnect(body []byte) error {
 	return nil
 }
 
+func (c *Client) resolvePublishTopic(pkt *protocol.PublishPacket) (string, error) {
+	if c.version != protocol.V50 {
+		return pkt.Topic, nil
+	}
+	topic := pkt.Topic
+	max := uint16(c.broker.cfg.Broker.TopicAliasMax)
+	if pkt.TopicAlias > 0 && max > 0 && pkt.TopicAlias > max {
+		return "", protocol.ErrProtocolViolation
+	}
+	if max == 0 && pkt.TopicAlias > 0 {
+		return "", protocol.ErrProtocolViolation
+	}
+	if topic == "" {
+		c.topicAliasMu.RLock()
+		prev, ok := c.topicAliases[pkt.TopicAlias]
+		c.topicAliasMu.RUnlock()
+		if !ok {
+			return "", protocol.ErrProtocolViolation
+		}
+		return prev, nil
+	}
+	if pkt.TopicAlias > 0 && max > 0 {
+		c.topicAliasMu.Lock()
+		if c.topicAliases == nil {
+			c.topicAliases = make(map[uint16]string)
+		}
+		c.topicAliases[pkt.TopicAlias] = topic
+		c.topicAliasMu.Unlock()
+	}
+	return topic, nil
+}
+
 // ─── PUBLISH ─────────────────────────────────────────────────────────────────
 
 func (c *Client) handlePublish(fh protocol.FixedHeader, body []byte) error {
@@ -316,12 +356,16 @@ func (c *Client) handlePublish(fh protocol.FixedHeader, body []byte) error {
 	if err != nil {
 		return err
 	}
+	topic, err := c.resolvePublishTopic(pkt)
+	if err != nil {
+		return err
+	}
 	if pkt.MessageExpiryInterval > 0 && time.Since(pkt.ReceivedAt) > time.Duration(pkt.MessageExpiryInterval)*time.Second {
 		metrics.DroppedTotal.WithLabelValues("message_expired").Inc()
 		return nil
 	}
 
-	if !c.broker.authn.CanPublish(c.clientID, pkt.Topic) {
+	if !c.broker.authn.CanPublish(c.clientID, topic) {
 		if pkt.QoS == protocol.QoS1 {
 			c.enqueue(protocol.EncodeAck(protocol.PUBACK, pkt.PacketID))
 		}
@@ -331,17 +375,17 @@ func (c *Client) handlePublish(fh protocol.FixedHeader, body []byte) error {
 
 	metrics.PublishTotal.WithLabelValues(fmt.Sprintf("%d", pkt.QoS)).Inc()
 	metrics.PublishBytes.Add(float64(len(pkt.Payload)))
-	if err := c.broker.plugins.OnPublish(c.clientID, pkt.Topic, pkt.Payload, pkt.QoS, pkt.Retain); err != nil {
+	if err := c.broker.plugins.OnPublish(c.clientID, topic, pkt.Payload, pkt.QoS, pkt.Retain); err != nil {
 		metrics.DroppedTotal.WithLabelValues("plugin_publish").Inc()
 		return nil
 	}
 
 	switch pkt.QoS {
 	case protocol.QoS0:
-		c.broker.router.Publish(pkt.Topic, pkt.Payload, pkt.QoS, pkt.Retain)
+		c.broker.router.Publish(topic, pkt.Payload, pkt.QoS, pkt.Retain)
 
 	case protocol.QoS1:
-		c.broker.router.Publish(pkt.Topic, pkt.Payload, pkt.QoS, pkt.Retain)
+		c.broker.router.Publish(topic, pkt.Payload, pkt.QoS, pkt.Retain)
 		c.enqueue(protocol.EncodeAck(protocol.PUBACK, pkt.PacketID))
 
 	case protocol.QoS2:
@@ -349,7 +393,7 @@ func (c *Client) handlePublish(fh protocol.FixedHeader, body []byte) error {
 		if c.sess.GetInFlight(pkt.PacketID) == nil {
 			c.sess.AddInFlight(&session.InFlight{
 				PacketID: pkt.PacketID,
-				Topic:    pkt.Topic,
+				Topic:    topic,
 				Payload:  append([]byte(nil), pkt.Payload...),
 				QoS:      pkt.QoS,
 				Retain:   pkt.Retain,
@@ -366,17 +410,17 @@ func (c *Client) handlePublish(fh protocol.FixedHeader, body []byte) error {
 		ctx := context.Background()
 		c.broker.redis.IncrMsgRate(ctx)
 		if pkt.Retain {
-			c.broker.redis.SetRetained(ctx, pkt.Topic, pkt.Payload, pkt.QoS)
+			c.broker.redis.SetRetained(ctx, topic, pkt.Payload, pkt.QoS)
 		}
-		c.broker.pg.LogMsg(ctx, pkt.Topic, pkt.Payload, pkt.QoS, pkt.Retain, c.clientID)
+		c.broker.pg.LogMsg(ctx, topic, pkt.Payload, pkt.QoS, pkt.Retain, c.clientID)
 		if c.broker.cfg.Cluster.Enabled {
-			part := c.broker.partitions.PartitionForTopic(pkt.Topic)
+			part := c.broker.partitions.PartitionForTopic(topic)
 			c.broker.redis.PublishCluster(ctx, &storage.ClusterMsg{
 				Ver:           1,
 				SourceBroker:  c.broker.id,
 				Partition:     part,
 				Sequence:      c.broker.clusterSeq.Add(1),
-				Topic:         pkt.Topic,
+				Topic:         topic,
 				Payload:       pkt.Payload,
 				QoS:           pkt.QoS,
 				Retain:        pkt.Retain,
