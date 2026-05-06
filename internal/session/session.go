@@ -69,12 +69,12 @@ type Session struct {
 	nextPktID uint32
 
 	// Outbound in-flight (broker→client): QoS 1 waiting PUBACK, QoS 2 sequence
-	outMu    sync.Mutex
+	outMu     sync.Mutex
 	outFlight map[uint16]*InFlight
 
 	// Inbound in-flight (client→broker): QoS 2 PUBLISH received, awaiting PUBREL
 	inMu     sync.Mutex
-	inFlight  map[uint16]*InFlight
+	inFlight map[uint16]*InFlight
 
 	// Offline queue for persistent sessions
 	qMu      sync.Mutex
@@ -137,7 +137,7 @@ func (s *Session) Info() (connectedAt, lastSeen time.Time, connected bool) {
 func (s *Session) NextPacketID() uint16 {
 	for {
 		next := atomic.AddUint32(&s.nextPktID, 1)
-		id   := uint16(next)
+		id := uint16(next)
 		if id == 0 {
 			id = 1
 		}

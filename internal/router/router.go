@@ -49,8 +49,8 @@ type Retained struct {
 // ─── Trie Node ────────────────────────────────────────────────────────────────
 
 type node struct {
-	mu          sync.RWMutex
-	children    map[string]*node
+	mu       sync.RWMutex
+	children map[string]*node
 	// subscribers is a copy-on-write map: clientID → *Subscriber
 	// Protected by mu; replaced atomically.
 	subscribers map[string]*Subscriber
@@ -351,7 +351,7 @@ func (r *Router) matchSubscribers(topic string) map[string]*Subscriber {
 func (r *Router) SendRetained(filter string, sub *Subscriber) {
 	r.retained.Range(func(key, value any) bool {
 		topic := key.(string)
-		msg   := value.(*Retained)
+		msg := value.(*Retained)
 		if TopicMatchesFilter(topic, filter) {
 			effQoS := msg.QoS
 			if sub.QoS < effQoS {

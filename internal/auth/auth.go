@@ -2,8 +2,8 @@
 package auth
 
 import (
-	"crypto/x509"
 	"crypto/subtle"
+	"crypto/x509"
 	"errors"
 	"strings"
 	"sync"
@@ -87,20 +87,20 @@ type Authenticator struct {
 	aclRules []*ACLRule
 
 	// JWT cache: avoids bcrypt-level work for repeated JWT validations
-	cacheMu    sync.RWMutex
-	tokenCache map[string]*cachedClaims
+	cacheMu            sync.RWMutex
+	tokenCache         map[string]*cachedClaims
 	revokedCertSerials map[string]struct{}
 }
 
 // New creates a new Authenticator.
 func New(secret, issuer string, duration time.Duration, bcryptCost int) *Authenticator {
 	a := &Authenticator{
-		secret:     []byte(secret),
-		issuer:     issuer,
-		duration:   duration,
-		cost:       bcryptCost,
-		users:      make(map[string]*User),
-		tokenCache: make(map[string]*cachedClaims),
+		secret:             []byte(secret),
+		issuer:             issuer,
+		duration:           duration,
+		cost:               bcryptCost,
+		users:              make(map[string]*User),
+		tokenCache:         make(map[string]*cachedClaims),
 		revokedCertSerials: make(map[string]struct{}),
 	}
 	a.loadDefaultACL()

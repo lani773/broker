@@ -96,15 +96,15 @@ const (
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 var (
-	ErrMalformed        = errors.New("malformed packet")
-	ErrProtocolViolation = errors.New("protocol violation")
-	ErrTooLarge         = errors.New("packet too large")
-	ErrInvalidVarInt    = errors.New("invalid variable length integer")
-	ErrInvalidQoS       = errors.New("invalid QoS level")
-	ErrInvalidTopic     = errors.New("invalid topic name")
+	ErrMalformed          = errors.New("malformed packet")
+	ErrProtocolViolation  = errors.New("protocol violation")
+	ErrTooLarge           = errors.New("packet too large")
+	ErrInvalidVarInt      = errors.New("invalid variable length integer")
+	ErrInvalidQoS         = errors.New("invalid QoS level")
+	ErrInvalidTopic       = errors.New("invalid topic name")
 	ErrUnsupportedVersion = errors.New("unsupported protocol version")
-	ErrInvalidClientID  = errors.New("invalid client identifier")
-	ErrZeroPacketID     = errors.New("packet identifier must be non-zero for QoS > 0")
+	ErrInvalidClientID    = errors.New("invalid client identifier")
+	ErrZeroPacketID       = errors.New("packet identifier must be non-zero for QoS > 0")
 )
 
 // ─── Buffer Pool ──────────────────────────────────────────────────────────────
@@ -154,13 +154,13 @@ func ReadFixed(r io.Reader) (FixedHeader, error) {
 
 	// Variable-length remaining length (1-4 bytes, 7 bits per byte)
 	mult := 1
-	val  := 0
+	val := 0
 	for i := 0; i < 4; i++ {
 		if _, err := io.ReadFull(r, b1[:]); err != nil {
 			return FixedHeader{}, fmt.Errorf("remaining length: %w", err)
 		}
 		digit := int(b1[0])
-		val  += (digit & 0x7F) * mult
+		val += (digit & 0x7F) * mult
 		mult *= 128
 		if digit&0x80 == 0 {
 			break
@@ -236,9 +236,9 @@ func appendUint16(b []byte, v uint16) []byte {
 
 // ConnectPacket represents a decoded CONNECT packet.
 type ConnectPacket struct {
-	Version      byte
-	CleanSession bool
-	KeepAlive    uint16
+	Version               byte
+	CleanSession          bool
+	KeepAlive             uint16
 	SessionExpiryInterval uint32
 
 	// Flags
@@ -291,11 +291,11 @@ func DecodeConnect(body []byte) (*ConnectPacket, error) {
 		return nil, ErrProtocolViolation
 	}
 	pkt.CleanSession = f&0x02 != 0
-	pkt.WillFlag     = f&0x04 != 0
-	pkt.WillQoS      = (f >> 3) & 0x03
-	pkt.WillRetain   = f&0x20 != 0
-	pkt.HasPassword  = f&0x40 != 0
-	pkt.HasUsername  = f&0x80 != 0
+	pkt.WillFlag = f&0x04 != 0
+	pkt.WillQoS = (f >> 3) & 0x03
+	pkt.WillRetain = f&0x20 != 0
+	pkt.HasPassword = f&0x40 != 0
+	pkt.HasUsername = f&0x80 != 0
 
 	if !pkt.WillFlag && (pkt.WillQoS != 0 || pkt.WillRetain) {
 		return nil, ErrProtocolViolation
@@ -393,12 +393,12 @@ func EncodeConnack(sessionPresent bool, code byte) []byte {
 // PublishPacket is a decoded MQTT PUBLISH packet.
 // Payload is a direct slice into the read buffer where possible.
 type PublishPacket struct {
-	Dup      bool
-	QoS      byte
-	Retain   bool
-	Topic    string
-	PacketID uint16
-	Payload  []byte
+	Dup                   bool
+	QoS                   byte
+	Retain                bool
+	Topic                 string
+	PacketID              uint16
+	Payload               []byte
 	MessageExpiryInterval uint32
 	TopicAlias            uint16
 	ReceivedAt            time.Time
@@ -406,11 +406,11 @@ type PublishPacket struct {
 
 // DecodePublish decodes the variable header + payload of a PUBLISH packet.
 func DecodePublish(version byte, fh FixedHeader, body []byte) (*PublishPacket, error) {
-	r   := newSliceReader(body)
+	r := newSliceReader(body)
 	pkt := &PublishPacket{
-		Dup:    fh.Flags&0x08 != 0,
-		QoS:    (fh.Flags >> 1) & 0x03,
-		Retain: fh.Flags&0x01 != 0,
+		Dup:        fh.Flags&0x08 != 0,
+		QoS:        (fh.Flags >> 1) & 0x03,
+		Retain:     fh.Flags&0x01 != 0,
 		ReceivedAt: time.Now(),
 	}
 	if pkt.QoS > QoS2 {
@@ -465,13 +465,13 @@ func DecodePublish(version byte, fh FixedHeader, body []byte) (*PublishPacket, e
 // For QoS 0 fire-and-forget the slice can be used immediately.
 func EncodePublish(topic string, payload []byte, qos byte, retain bool, packetID uint16, dup bool) []byte {
 	// Calculate total size to avoid reallocations
-	topicLen   := 2 + len(topic)
-	pidLen     := 0
+	topicLen := 2 + len(topic)
+	pidLen := 0
 	if qos > 0 {
 		pidLen = 2
 	}
 	payloadLen := len(payload)
-	remaining  := topicLen + pidLen + payloadLen
+	remaining := topicLen + pidLen + payloadLen
 
 	// Encode remaining length (1-4 bytes)
 	var varBuf [4]byte
@@ -683,7 +683,7 @@ func (r *sliceReader) Remaining() int { return len(r.data) - r.pos }
 func skipProps(r *sliceReader) error {
 	var propLen int
 	mult := 1
-	buf  := make([]byte, 1)
+	buf := make([]byte, 1)
 	for i := 0; i < 4; i++ {
 		if _, err := r.Read(buf); err != nil {
 			return err

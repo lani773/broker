@@ -18,8 +18,8 @@ func New(level, format string) (*zap.Logger, error) {
 
 	if format == "console" {
 		cfg.Encoding = "console"
-		cfg.EncoderConfig.EncodeTime   = zapcore.ISO8601TimeEncoder
-		cfg.EncoderConfig.EncodeLevel  = zapcore.CapitalColorLevelEncoder
+		cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+		cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	}
 
 	cfg.OutputPaths = []string{"stdout"}

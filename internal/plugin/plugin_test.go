@@ -11,9 +11,9 @@ func (h *testHook) OnClientConnect(string, string) error {
 	h.connects++
 	return nil
 }
-func (h *testHook) OnClientDisconnect(string, string) error      { return nil }
+func (h *testHook) OnClientDisconnect(string, string) error            { return nil }
 func (h *testHook) OnPublish(string, string, []byte, byte, bool) error { return nil }
-func (h *testHook) OnSubscribe(string, string, byte) error       { return nil }
+func (h *testHook) OnSubscribe(string, string, byte) error             { return nil }
 
 func TestManagerDispatchesHooks(t *testing.T) {
 	m := NewManager()

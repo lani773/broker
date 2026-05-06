@@ -1,11 +1,12 @@
 // LUMA Go Test Client - comprehensive MQTT protocol tests and load benchmarks.
 //
 // Usage:
-//   go run client.go                            # all tests
-//   go run client.go -test qos2                 # single test
-//   go run client.go -bench -clients 1000       # load test
-//   go run client.go -monitor "devices/#"       # live subscribe
-//   go run client.go -api                       # REST API tests
+//
+//	go run client.go                            # all tests
+//	go run client.go -test qos2                 # single test
+//	go run client.go -bench -clients 1000       # load test
+//	go run client.go -monitor "devices/#"       # live subscribe
+//	go run client.go -api                       # REST API tests
 package main
 
 import (
@@ -55,8 +56,8 @@ type MQTTClient struct {
 	clientID string
 	mu       sync.Mutex
 
-	recvCh   chan Packet
-	doneCh   chan struct{}
+	recvCh chan Packet
+	doneCh chan struct{}
 }
 
 type Packet struct {
@@ -80,7 +81,7 @@ func Connect(addr, clientID, username, password string, cleanSession bool) (*MQT
 	// Build CONNECT packet
 	var payload bytes.Buffer
 	writeUTF8(&payload, "MQTT")
-	payload.WriteByte(4)         // v3.1.1
+	payload.WriteByte(4) // v3.1.1
 
 	var flags byte = 0x02 // CleanSession
 	if username != "" {
@@ -273,13 +274,15 @@ func dial(id string) (*MQTTClient, error) {
 	return Connect(brokerAddr(), id, *user, *pass, true)
 }
 
-func ok(msg string) { fmt.Printf("  ✅  %s\n", msg) }
+func ok(msg string)   { fmt.Printf("  ✅  %s\n", msg) }
 func fail(msg string) { fmt.Printf("  ❌  %s\n", msg) }
 func info(msg string) { fmt.Printf("  ℹ️   %s\n", msg) }
 func header(title string) {
 	fmt.Printf("\n%s\n  %s\n%s\n", line(), title, line())
 }
-func line() string { return "────────────────────────────────────────────────────" }
+func line() string {
+	return "────────────────────────────────────────────────────"
+}
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
@@ -301,14 +304,23 @@ func testQoS0() bool {
 	topic := "test/qos0/" + rid()
 
 	sub, err := dial("test-sub-qos0-" + rid())
-	if err != nil { fail(err.Error()); return false }
+	if err != nil {
+		fail(err.Error())
+		return false
+	}
 	defer sub.Disconnect()
 
-	if err := sub.Subscribe(topic, 0); err != nil { fail(err.Error()); return false }
+	if err := sub.Subscribe(topic, 0); err != nil {
+		fail(err.Error())
+		return false
+	}
 	time.Sleep(100 * time.Millisecond)
 
 	pub, err := dial("test-pub-qos0-" + rid())
-	if err != nil { fail(err.Error()); return false }
+	if err != nil {
+		fail(err.Error())
+		return false
+	}
 	defer pub.Disconnect()
 
 	pub.Publish(topic, []byte(`{"test":"qos0"}`), 0, false)
@@ -326,14 +338,20 @@ func testQoS1() bool {
 	topic := "test/qos1/" + rid()
 
 	sub, err := dial("test-sub-qos1-" + rid())
-	if err != nil { fail(err.Error()); return false }
+	if err != nil {
+		fail(err.Error())
+		return false
+	}
 	defer sub.Disconnect()
 
 	sub.Subscribe(topic, 1)
 	time.Sleep(100 * time.Millisecond)
 
 	pub, err := dial("test-pub-qos1-" + rid())
-	if err != nil { fail(err.Error()); return false }
+	if err != nil {
+		fail(err.Error())
+		return false
+	}
 	defer pub.Disconnect()
 
 	for i := 0; i < 5; i++ {
@@ -354,14 +372,20 @@ func testQoS2() bool {
 	topic := "test/qos2/" + rid()
 
 	sub, err := dial("test-sub-qos2-" + rid())
-	if err != nil { fail(err.Error()); return false }
+	if err != nil {
+		fail(err.Error())
+		return false
+	}
 	defer sub.Disconnect()
 
 	sub.Subscribe(topic, 2)
 	time.Sleep(100 * time.Millisecond)
 
 	pub, err := dial("test-pub-qos2-" + rid())
-	if err != nil { fail(err.Error()); return false }
+	if err != nil {
+		fail(err.Error())
+		return false
+	}
 	defer pub.Disconnect()
 
 	for i := 0; i < 3; i++ {
@@ -383,7 +407,10 @@ func testWildcards() bool {
 	base := "test/wc/" + rid()
 
 	sub, err := dial("test-sub-wc-" + rid())
-	if err != nil { fail(err.Error()); return false }
+	if err != nil {
+		fail(err.Error())
+		return false
+	}
 	defer sub.Disconnect()
 
 	sub.Subscribe(base+"/+/data", 0)
@@ -391,7 +418,10 @@ func testWildcards() bool {
 	time.Sleep(100 * time.Millisecond)
 
 	pub, err := dial("test-pub-wc-" + rid())
-	if err != nil { fail(err.Error()); return false }
+	if err != nil {
+		fail(err.Error())
+		return false
+	}
 	defer pub.Disconnect()
 
 	// Should match /+/data
@@ -442,7 +472,7 @@ func testRetained() bool {
 
 func testLWT() bool {
 	header("TEST: Last Will and Testament")
-	base    := "test/lwt/" + rid()
+	base := "test/lwt/" + rid()
 	lwtTopic := base + "/status"
 
 	// Observer subscribes to the LWT topic
@@ -453,12 +483,15 @@ func testLWT() bool {
 	// Client with LWT — we send raw CONNECT with will
 	// (paho would normally handle this; using our raw client)
 	conn, err := net.Dial("tcp", brokerAddr())
-	if err != nil { fail(err.Error()); return false }
+	if err != nil {
+		fail(err.Error())
+		return false
+	}
 
 	var buf bytes.Buffer
 	writeUTF8(&buf, "MQTT")
-	buf.WriteByte(4)    // v3.1.1
-	buf.WriteByte(0x06) // CleanSession + WillFlag
+	buf.WriteByte(4)                                // v3.1.1
+	buf.WriteByte(0x06)                             // CleanSession + WillFlag
 	binary.Write(&buf, binary.BigEndian, uint16(3)) // keepalive 3s
 	writeUTF8(&buf, "lwt-test-"+rid())
 	writeUTF8(&buf, lwtTopic)
@@ -496,7 +529,10 @@ func benchmarkThroughput() {
 
 	// Single subscriber
 	sub, err := dial("bench-sub-" + rid())
-	if err != nil { fail(err.Error()); return }
+	if err != nil {
+		fail(err.Error())
+		return
+	}
 	defer sub.Disconnect()
 	sub.Subscribe("bench/#", 0)
 	time.Sleep(300 * time.Millisecond)
@@ -648,7 +684,10 @@ func testAPI() {
 func liveMonitor(filter string) {
 	header(fmt.Sprintf("MONITOR: %s (Ctrl+C to stop)", filter))
 	c, err := dial("monitor-" + rid())
-	if err != nil { fail(err.Error()); return }
+	if err != nil {
+		fail(err.Error())
+		return
+	}
 	defer c.Disconnect()
 
 	c.Subscribe(filter, 0)
@@ -657,9 +696,9 @@ func liveMonitor(filter string) {
 		if msg, got := c.WaitMessage(5 * time.Second); got {
 			count++
 			topicLen := binary.BigEndian.Uint16(msg.Payload)
-			topic    := string(msg.Payload[2 : 2+topicLen])
-			payload  := msg.Payload[2+topicLen:]
-			ts       := time.Now().Format("15:04:05")
+			topic := string(msg.Payload[2 : 2+topicLen])
+			payload := msg.Payload[2+topicLen:]
+			ts := time.Now().Format("15:04:05")
 			fmt.Printf("  [%s] #%04d %s → %s\n", ts, count, topic, truncate(string(payload), 120))
 		} else {
 			fmt.Printf("  [waiting...]\n")
@@ -678,40 +717,58 @@ func encodeVarInt(n int) []byte {
 	for {
 		digit := n % 128
 		n /= 128
-		if n > 0 { digit |= 0x80 }
+		if n > 0 {
+			digit |= 0x80
+		}
 		buf = append(buf, byte(digit))
-		if n == 0 { break }
+		if n == 0 {
+			break
+		}
 	}
 	return buf
 }
 
 func extractPayload(p *Packet) string {
-	if p == nil || len(p.Payload) < 2 { return "" }
+	if p == nil || len(p.Payload) < 2 {
+		return ""
+	}
 	l := int(binary.BigEndian.Uint16(p.Payload))
-	if 2+l > len(p.Payload) { return "" }
+	if 2+l > len(p.Payload) {
+		return ""
+	}
 	return string(p.Payload[2+l:])
 }
 
 func fmtNum(n int64) string {
-	if n >= 1_000_000 { return fmt.Sprintf("%.1fM", float64(n)/1_000_000) }
-	if n >= 1_000     { return fmt.Sprintf("%.1fK", float64(n)/1_000) }
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1_000)
+	}
 	return fmt.Sprintf("%d", n)
 }
 
 func max64(a, b int64) int64 {
-	if a > b { return a }
+	if a > b {
+		return a
+	}
 	return b
 }
 
 func truncate(s string, n int) string {
-	if len(s) > n { return s[:n] + "…" }
+	if len(s) > n {
+		return s[:n] + "…"
+	}
 	return s
 }
 
 func apiLogin(base string) string {
 	body, _ := json.Marshal(map[string]string{"username": *user, "password": *pass})
 	resp, err := http.Post(base+"/auth/login", "application/json", bytes.NewReader(body))
-	if err != nil { return "" }
+	if err != nil {
+		return ""
+	}
 	defer resp.Body.Close()
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
@@ -773,16 +830,24 @@ func main() {
 	results := map[string]bool{}
 	for _, name := range run {
 		fn, ok := tests[name]
-		if !ok { continue }
+		if !ok {
+			continue
+		}
 		results[name] = fn()
 	}
 
 	passed := 0
-	for _, v := range results { if v { passed++ } }
+	for _, v := range results {
+		if v {
+			passed++
+		}
+	}
 	fmt.Printf("\n%s\n  RESULTS: %d/%d passed\n%s\n", line(), passed, len(results), line())
 	for _, name := range run {
 		icon := "✅"
-		if !results[name] { icon = "❌" }
+		if !results[name] {
+			icon = "❌"
+		}
 		fmt.Printf("  %s  %s\n", icon, name)
 	}
 	fmt.Println()
