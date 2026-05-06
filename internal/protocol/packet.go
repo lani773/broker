@@ -84,6 +84,14 @@ const (
 	ReasonUnspecifiedError byte = 0x80
 	ReasonNotAuthorized    byte = 0x87
 	ReasonQuotaExceeded    byte = 0x97
+
+	// MQTT v5 CONNACK reason codes used when mapping from v3.1.1 refusal codes or decode errors.
+	ConnackReasonV5MalformedPacket             byte = 0x81
+	ConnackReasonV5ProtocolError               byte = 0x82
+	ConnackReasonV5UnsupportedProtocolVersion byte = 0x84
+	ConnackReasonV5ClientIDNotValid            byte = 0x85
+	ConnackReasonV5BadUsernameOrPassword       byte = 0x86
+	ConnackReasonV5ServerUnavailable           byte = 0x88
 )
 
 // ─── Limits ───────────────────────────────────────────────────────────────────
@@ -377,6 +385,55 @@ func DecodeConnect(body []byte) (*ConnectPacket, error) {
 	return pkt, nil
 }
 
+// PeekConnectProtocolLevel reads the protocol level byte from a CONNECT payload (after protocol name).
+// It supports protocol names "MQTT" and "MQIsdp". On any parse error it returns ok=false.
+func PeekConnectProtocolLevel(body []byte) (level byte, ok bool) {
+	r := newSliceReader(body)
+	protoName, err := readString(r)
+	if err != nil {
+		return 0, false
+	}
+	if protoName != "MQTT" && protoName != "MQIsdp" {
+		return 0, false
+	}
+	var ver [1]byte
+	if _, err := io.ReadFull(r, ver[:]); err != nil {
+		return 0, false
+	}
+	return ver[0], true
+}
+
+// ConnackReasonV5FromV311 maps a MQTT v3.1.1 CONNACK return code to an MQTT v5 CONNACK Reason Code.
+func ConnackReasonV5FromV311(code byte) byte {
+	switch code {
+	case ConnAccepted:
+		return ReasonSuccess
+	case ConnRefusedProtocol:
+		return ConnackReasonV5UnsupportedProtocolVersion
+	case ConnRefusedIDRejected:
+		return ConnackReasonV5ClientIDNotValid
+	case ConnRefusedServerUnavail:
+		return ConnackReasonV5ServerUnavailable
+	case ConnRefusedBadCredentials:
+		return ConnackReasonV5BadUsernameOrPassword
+	case ConnRefusedNotAuthorized:
+		return ReasonNotAuthorized
+	default:
+		return ConnackReasonV5ProtocolError
+	}
+}
+
+// ConnackReasonV5ForDecodeError picks an MQTT v5 CONNACK Reason Code for a failed DecodeConnect.
+func ConnackReasonV5ForDecodeError(err error) byte {
+	if errors.Is(err, ErrUnsupportedVersion) {
+		return ConnackReasonV5UnsupportedProtocolVersion
+	}
+	if errors.Is(err, ErrProtocolViolation) {
+		return ConnackReasonV5ProtocolError
+	}
+	return ConnackReasonV5MalformedPacket
+}
+
 // ─── CONNACK ──────────────────────────────────────────────────────────────────
 
 // EncodeConnack returns a 4-byte CONNACK packet.
@@ -389,14 +446,15 @@ func EncodeConnack(sessionPresent bool, code byte) []byte {
 	return pkt[:]
 }
 
-// EncodeConnackV5 builds a MQTT v5 CONNACK with optional Topic Alias Maximum (0x22).
+// EncodeConnackV5 builds a MQTT v5 CONNACK with optional Topic Alias Maximum (0x22) on Success only.
+// Session Present must be 0 when Reason Code is not Success (MQTT v5).
 func EncodeConnackV5(sessionPresent bool, reasonCode byte, topicAliasMax uint16) []byte {
 	flags := byte(0)
-	if sessionPresent {
+	if reasonCode == ConnAccepted && sessionPresent {
 		flags = 0x01
 	}
 	var props []byte
-	if topicAliasMax > 0 {
+	if reasonCode == ConnAccepted && topicAliasMax > 0 {
 		props = append(props, 0x22, byte(topicAliasMax>>8), byte(topicAliasMax))
 	}
 	var propLenEnc [4]byte
@@ -406,7 +464,7 @@ func EncodeConnackV5(sessionPresent bool, reasonCode byte, topicAliasMax uint16)
 	nRem := encodeVarInt(remEnc[:], rem)
 
 	out := make([]byte, 0, 1+nRem+rem)
-	out = append(out, byte(CONNACK)<<4, 0)
+	out = append(out, byte(CONNACK)<<4)
 	out = append(out, remEnc[:nRem]...)
 	out = append(out, flags, reasonCode)
 	out = append(out, propLenEnc[:nProp]...)

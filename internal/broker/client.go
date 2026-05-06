@@ -198,10 +198,27 @@ func (c *Client) handle(fh protocol.FixedHeader, body []byte) error {
 
 // ─── CONNECT ─────────────────────────────────────────────────────────────────
 
+// sendConnackFailure sends a refused CONNACK using MQTT v5 encoding when the peer is v5
+// (known from c.version after CONNECT decode, or from peekBody before decode succeeds).
+func (c *Client) sendConnackFailure(reasonV311, reasonV5 byte, peekBody []byte) {
+	useV5 := c.version == protocol.V50
+	if !useV5 && len(peekBody) > 0 {
+		if v, ok := protocol.PeekConnectProtocolLevel(peekBody); ok && v == protocol.V50 {
+			useV5 = true
+		}
+	}
+	if useV5 {
+		c.enqueue(protocol.EncodeConnackV5(false, reasonV5, 0))
+		return
+	}
+	c.enqueue(protocol.EncodeConnack(false, reasonV311))
+}
+
 func (c *Client) handleConnect(body []byte) error {
 	pkt, err := protocol.DecodeConnect(body)
 	if err != nil {
-		c.enqueue(protocol.EncodeConnack(false, protocol.ConnRefusedProtocol))
+		reasonV5 := protocol.ConnackReasonV5ForDecodeError(err)
+		c.sendConnackFailure(protocol.ConnRefusedProtocol, reasonV5, body)
 		return err
 	}
 
@@ -210,19 +227,19 @@ func (c *Client) handleConnect(body []byte) error {
 	// Authentication
 	if tc, ok := c.conn.(*tls.Conn); ok {
 		if st := tc.ConnectionState(); len(st.PeerCertificates) > 0 {
-			if identity, err := c.broker.authn.AuthX509(st.PeerCertificates[0]); err == nil {
+			if identity, errX509 := c.broker.authn.AuthX509(st.PeerCertificates[0]); errX509 == nil {
 				c.username = identity
 			} else {
 				metrics.AuthFailTotal.WithLabelValues("bad_x509").Inc()
-				c.enqueue(protocol.EncodeConnack(false, protocol.ConnRefusedBadCredentials))
-				return err
+				c.sendConnackFailure(protocol.ConnRefusedBadCredentials, protocol.ConnackReasonV5FromV311(protocol.ConnRefusedBadCredentials), nil)
+				return errX509
 			}
 		}
 	}
 	if c.username == "" && pkt.HasUsername {
 		if err := c.broker.authn.AuthPassword(pkt.Username, pkt.Password); err != nil {
 			metrics.AuthFailTotal.WithLabelValues("bad_credentials").Inc()
-			c.enqueue(protocol.EncodeConnack(false, protocol.ConnRefusedBadCredentials))
+			c.sendConnackFailure(protocol.ConnRefusedBadCredentials, protocol.ConnackReasonV5FromV311(protocol.ConnRefusedBadCredentials), nil)
 			return err
 		}
 		c.username = pkt.Username
@@ -230,7 +247,7 @@ func (c *Client) handleConnect(body []byte) error {
 		claims, err := c.broker.authn.AuthJWT(string(pkt.Password))
 		if err != nil {
 			metrics.AuthFailTotal.WithLabelValues("bad_token").Inc()
-			c.enqueue(protocol.EncodeConnack(false, protocol.ConnRefusedBadCredentials))
+			c.sendConnackFailure(protocol.ConnRefusedBadCredentials, protocol.ConnackReasonV5FromV311(protocol.ConnRefusedBadCredentials), nil)
 			return err
 		}
 		c.username = claims.Username
@@ -240,12 +257,17 @@ func (c *Client) handleConnect(body []byte) error {
 	cid := pkt.ClientID
 	if cid == "" {
 		if !pkt.CleanSession {
-			c.enqueue(protocol.EncodeConnack(false, protocol.ConnRefusedIDRejected))
+			c.sendConnackFailure(protocol.ConnRefusedIDRejected, protocol.ConnackReasonV5ClientIDNotValid, nil)
 			return protocol.ErrInvalidClientID
 		}
 		cid = fmt.Sprintf("auto-%s-%d", c.remoteAddr, time.Now().UnixNano())
 	}
 	c.clientID = cid
+
+	if err := c.broker.plugins.OnClientConnect(cid, c.username); err != nil {
+		c.sendConnackFailure(protocol.ConnRefusedNotAuthorized, protocol.ConnackReasonV5FromV311(protocol.ConnRefusedNotAuthorized), nil)
+		return err
+	}
 
 	// Takeover any existing connection with same ID
 	c.broker.takeover(cid)
@@ -288,9 +310,6 @@ func (c *Client) handleConnect(body []byte) error {
 	metrics.ConnectTotal.Inc()
 	metrics.ActiveConnections.Inc()
 	metrics.ActiveSessions.Inc()
-	if err := c.broker.plugins.OnClientConnect(c.clientID, c.username); err != nil {
-		return err
-	}
 
 	c.logger.Info("client connected",
 		zap.String("client", cid),

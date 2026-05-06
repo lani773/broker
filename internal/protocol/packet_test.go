@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
 )
@@ -71,6 +72,61 @@ func TestEncodeConnackV5TopicAliasMax(t *testing.T) {
 	b := EncodeConnackV5(true, ConnAccepted, 64)
 	if len(b) < 8 {
 		t.Fatalf("CONNACK v5 too short: %d", len(b))
+	}
+	// Property id 0x22 Topic Alias Maximum must appear only on success.
+	if bytes.Index(b, []byte{0x22, 0x00, 0x40}) < 0 {
+		t.Fatal("missing Topic Alias Maximum property")
+	}
+}
+
+func TestEncodeConnackV5FailureOmitsTopicAliasAndSessionPresent(t *testing.T) {
+	b := EncodeConnackV5(true, ConnackReasonV5BadUsernameOrPassword, 99)
+	if bytes.Contains(b, []byte{0x22}) {
+		t.Fatal("Topic Alias property must not be sent on CONNACK failure")
+	}
+	// Session Present flag byte follows remaining length in variable header: skip fixed hdr + remlen then flags byte.
+	r := bytes.NewReader(b)
+	fh, err := ReadFixed(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vh := make([]byte, fh.RemainingLength)
+	if _, err := io.ReadFull(r, vh); err != nil {
+		t.Fatal(err)
+	}
+	if len(vh) < 2 {
+		t.Fatal("short CONNACK vh")
+	}
+	if vh[0]&0x01 != 0 {
+		t.Fatal("Session Present must be 0 when Reason Code is not Success")
+	}
+	if vh[1] != ConnackReasonV5BadUsernameOrPassword {
+		t.Fatalf("reason code: %#x", vh[1])
+	}
+}
+
+func TestPeekConnectProtocolLevel(t *testing.T) {
+	body := []byte{0x00, 0x04, 'M', 'Q', 'T', 'T', V50}
+	lev, ok := PeekConnectProtocolLevel(body)
+	if !ok || lev != V50 {
+		t.Fatalf("peek MQTT v5: ok=%v lev=%d", ok, lev)
+	}
+	body311 := []byte{0x00, 0x04, 'M', 'Q', 'T', 'T', V311}
+	lev, ok = PeekConnectProtocolLevel(body311)
+	if !ok || lev != V311 {
+		t.Fatalf("peek v311: ok=%v lev=%d", ok, lev)
+	}
+}
+
+func TestConnackReasonV5ForDecodeError(t *testing.T) {
+	if got := ConnackReasonV5ForDecodeError(ErrUnsupportedVersion); got != ConnackReasonV5UnsupportedProtocolVersion {
+		t.Fatalf("unsupported version -> %#x", got)
+	}
+	if got := ConnackReasonV5ForDecodeError(ErrProtocolViolation); got != ConnackReasonV5ProtocolError {
+		t.Fatalf("protocol violation -> %#x", got)
+	}
+	if got := ConnackReasonV5ForDecodeError(errors.New("other")); got != ConnackReasonV5MalformedPacket {
+		t.Fatalf("generic -> %#x", got)
 	}
 }
 
