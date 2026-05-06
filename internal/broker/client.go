@@ -367,7 +367,7 @@ func (c *Client) handlePublish(fh protocol.FixedHeader, body []byte) error {
 
 	if !c.broker.authn.CanPublish(c.clientID, topic) {
 		if pkt.QoS == protocol.QoS1 {
-			c.enqueue(protocol.EncodeAck(protocol.PUBACK, pkt.PacketID))
+			c.enqueuePubAck(protocol.PUBACK, pkt.PacketID)
 		}
 		metrics.DroppedTotal.WithLabelValues("acl_denied").Inc()
 		return nil
@@ -386,7 +386,7 @@ func (c *Client) handlePublish(fh protocol.FixedHeader, body []byte) error {
 
 	case protocol.QoS1:
 		c.broker.router.Publish(topic, pkt.Payload, pkt.QoS, pkt.Retain)
-		c.enqueue(protocol.EncodeAck(protocol.PUBACK, pkt.PacketID))
+		c.enqueuePubAck(protocol.PUBACK, pkt.PacketID)
 
 	case protocol.QoS2:
 		// Phase 1: store if not already received
@@ -400,7 +400,7 @@ func (c *Client) handlePublish(fh protocol.FixedHeader, body []byte) error {
 				SentAt:   time.Now(),
 			})
 		}
-		c.enqueue(protocol.EncodeAck(protocol.PUBREC, pkt.PacketID))
+		c.enqueuePubAck(protocol.PUBREC, pkt.PacketID)
 	}
 
 	metrics.PublishLatency.Observe(time.Since(start).Seconds())
@@ -449,7 +449,7 @@ func (c *Client) handlePubrec(body []byte) error {
 		return err
 	}
 	c.sess.SetOutFlightPhase(id, session.QoS2Received)
-	c.enqueue(protocol.EncodeAck(protocol.PUBREL, id))
+	c.enqueuePubAck(protocol.PUBREL, id)
 	return nil
 }
 
@@ -461,7 +461,7 @@ func (c *Client) handlePubrel(body []byte) error {
 	if msg := c.sess.AckInFlight(id); msg != nil {
 		c.broker.router.Publish(msg.Topic, msg.Payload, msg.QoS, msg.Retain)
 	}
-	c.enqueue(protocol.EncodeAck(protocol.PUBCOMP, id))
+	c.enqueuePubAck(protocol.PUBCOMP, id)
 	return nil
 }
 
@@ -477,7 +477,7 @@ func (c *Client) handlePubcomp(body []byte) error {
 // ─── SUBSCRIBE ────────────────────────────────────────────────────────────────
 
 func (c *Client) handleSubscribe(body []byte) error {
-	packetID, subs, err := protocol.DecodeSubscribe(body)
+	packetID, subs, err := protocol.DecodeSubscribe(c.version, body)
 	if err != nil {
 		return err
 	}
@@ -517,14 +517,18 @@ func (c *Client) handleSubscribe(body []byte) error {
 		})
 	}
 
-	c.enqueue(protocol.EncodeSuback(packetID, codes))
+	if c.version == protocol.V50 {
+		c.enqueue(protocol.EncodeSubackV5(packetID, nil, codes))
+	} else {
+		c.enqueue(protocol.EncodeSuback(packetID, codes))
+	}
 	return nil
 }
 
 // ─── UNSUBSCRIBE ─────────────────────────────────────────────────────────────
 
 func (c *Client) handleUnsubscribe(body []byte) error {
-	packetID, filters, err := protocol.DecodeUnsubscribe(body)
+	packetID, filters, err := protocol.DecodeUnsubscribe(c.version, body)
 	if err != nil {
 		return err
 	}
@@ -570,7 +574,13 @@ func (c *Client) makeDeliverFn() router.DeliverFn {
 			})
 		}
 
-		c.enqueue(protocol.EncodePublish(topic, payload, qos, retain, pid, false))
+		var enc []byte
+		if c.version == protocol.V50 {
+			enc = protocol.EncodePublishV5(topic, payload, qos, retain, pid, false, nil)
+		} else {
+			enc = protocol.EncodePublish(topic, payload, qos, retain, pid, false)
+		}
+		c.enqueue(enc)
 	}
 }
 
@@ -623,6 +633,14 @@ func (c *Client) writeLoop(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (c *Client) enqueuePubAck(t protocol.PacketType, packetID uint16) {
+	if c.version == protocol.V50 {
+		c.enqueue(protocol.EncodeAckV5(t, packetID, 0x00, nil))
+		return
+	}
+	c.enqueue(protocol.EncodeAck(t, packetID))
 }
 
 // enqueue pushes data to the write queue. Non-blocking: drops if full.

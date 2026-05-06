@@ -530,6 +530,43 @@ func EncodePublish(topic string, payload []byte, qos byte, retain bool, packetID
 	return out
 }
 
+// EncodePublishV5 encodes MQTT v5 PUBLISH: Topic, [Packet ID], Property Length + props, Payload.
+func EncodePublishV5(topic string, payload []byte, qos byte, retain bool, packetID uint16, dup bool, props []byte) []byte {
+	topicLen := 2 + len(topic)
+	pidLen := 0
+	if qos > 0 {
+		pidLen = 2
+	}
+	var propLenEnc [4]byte
+	nProp := encodeVarInt(propLenEnc[:], len(props))
+	propSection := nProp + len(props)
+	payloadLen := len(payload)
+	remaining := topicLen + pidLen + propSection + payloadLen
+
+	var varBuf [4]byte
+	varLen := encodeVarInt(varBuf[:], remaining)
+
+	out := make([]byte, 0, 1+varLen+remaining)
+	flags := (byte(PUBLISH) << 4)
+	if dup {
+		flags |= 0x08
+	}
+	flags |= (qos & 0x03) << 1
+	if retain {
+		flags |= 0x01
+	}
+	out = append(out, flags)
+	out = append(out, varBuf[:varLen]...)
+	out = appendString(out, topic)
+	if qos > 0 {
+		out = appendUint16(out, packetID)
+	}
+	out = append(out, propLenEnc[:nProp]...)
+	out = append(out, props...)
+	out = append(out, payload...)
+	return out
+}
+
 // ─── PUBACK / PUBREC / PUBREL / PUBCOMP ──────────────────────────────────────
 
 // EncodeAck encodes a 4-byte QoS-ack packet (PUBACK, PUBREC, PUBREL, PUBCOMP).
@@ -544,6 +581,27 @@ func EncodeAck(t PacketType, packetID uint16) []byte {
 		byte(packetID >> 8),
 		byte(packetID),
 	}
+}
+
+// EncodeAckV5 encodes MQTT v5 PUBACK, PUBREC, PUBREL, or PUBCOMP (reason code + properties).
+func EncodeAckV5(t PacketType, packetID uint16, reasonCode byte, props []byte) []byte {
+	flags := byte(0)
+	if t == PUBREL {
+		flags = 0x02
+	}
+	var propLenEnc [4]byte
+	nProp := encodeVarInt(propLenEnc[:], len(props))
+	remaining := 2 + 1 + nProp + len(props)
+	var remEnc [4]byte
+	nRem := encodeVarInt(remEnc[:], remaining)
+	out := make([]byte, 0, 1+nRem+remaining)
+	out = append(out, byte(t)<<4|flags)
+	out = append(out, remEnc[:nRem]...)
+	out = appendUint16(out, packetID)
+	out = append(out, reasonCode)
+	out = append(out, propLenEnc[:nProp]...)
+	out = append(out, props...)
+	return out
 }
 
 // DecodePacketID reads a 2-byte packet identifier from a body slice.
@@ -562,12 +620,17 @@ type Subscription struct {
 	QoS    byte
 }
 
-// DecodeSubscribe decodes a SUBSCRIBE packet body.
-func DecodeSubscribe(body []byte) (packetID uint16, subs []Subscription, err error) {
+// DecodeSubscribe decodes a SUBSCRIBE packet body (MQTT v3.1.1 or v5).
+func DecodeSubscribe(version byte, body []byte) (packetID uint16, subs []Subscription, err error) {
 	r := newSliceReader(body)
 	packetID, err = readUint16(r)
 	if err != nil {
 		return 0, nil, err
+	}
+	if version == V50 {
+		if err := skipProps(r); err != nil {
+			return 0, nil, err
+		}
 	}
 
 	for r.Remaining() > 0 {
@@ -579,6 +642,7 @@ func DecodeSubscribe(body []byte) (packetID uint16, subs []Subscription, err err
 		if _, err := io.ReadFull(r, qosBuf); err != nil {
 			return 0, nil, err
 		}
+		// v5 Subscription Options: lowest 2 bits = Maximum QoS (same as v3 QoS byte).
 		subs = append(subs, Subscription{Filter: filter, QoS: qosBuf[0] & 0x03})
 	}
 	if len(subs) == 0 {
@@ -601,14 +665,36 @@ func EncodeSuback(packetID uint16, codes []byte) []byte {
 	return out
 }
 
+// EncodeSubackV5 encodes MQTT v5 SUBACK (property length + reason codes).
+func EncodeSubackV5(packetID uint16, props []byte, reasonCodes []byte) []byte {
+	var propLenEnc [4]byte
+	nProp := encodeVarInt(propLenEnc[:], len(props))
+	remaining := 2 + nProp + len(props) + len(reasonCodes)
+	var varBuf [4]byte
+	varLen := encodeVarInt(varBuf[:], remaining)
+	out := make([]byte, 0, 1+varLen+remaining)
+	out = append(out, byte(SUBACK)<<4)
+	out = append(out, varBuf[:varLen]...)
+	out = appendUint16(out, packetID)
+	out = append(out, propLenEnc[:nProp]...)
+	out = append(out, props...)
+	out = append(out, reasonCodes...)
+	return out
+}
+
 // ─── UNSUBSCRIBE ─────────────────────────────────────────────────────────────
 
-// DecodeUnsubscribe decodes an UNSUBSCRIBE packet body.
-func DecodeUnsubscribe(body []byte) (packetID uint16, filters []string, err error) {
+// DecodeUnsubscribe decodes an UNSUBSCRIBE packet body (MQTT v3.1.1 or v5).
+func DecodeUnsubscribe(version byte, body []byte) (packetID uint16, filters []string, err error) {
 	r := newSliceReader(body)
 	packetID, err = readUint16(r)
 	if err != nil {
 		return
+	}
+	if version == V50 {
+		if err := skipProps(r); err != nil {
+			return 0, nil, err
+		}
 	}
 	for r.Remaining() > 0 {
 		f, err2 := readString(r)
@@ -620,9 +706,26 @@ func DecodeUnsubscribe(body []byte) (packetID uint16, filters []string, err erro
 	return
 }
 
-// EncodeUnsuback encodes an UNSUBACK packet.
+// EncodeUnsuback encodes an MQTT v3.1.1 UNSUBACK packet (packet id only).
 func EncodeUnsuback(packetID uint16) []byte {
 	return []byte{byte(UNSUBACK) << 4, 2, byte(packetID >> 8), byte(packetID)}
+}
+
+// EncodeUnsubackV5 encodes MQTT v5 UNSUBACK with one reason code per unsubscribed filter.
+func EncodeUnsubackV5(packetID uint16, props []byte, reasonCodes []byte) []byte {
+	var propLenEnc [4]byte
+	nProp := encodeVarInt(propLenEnc[:], len(props))
+	remaining := 2 + nProp + len(props) + len(reasonCodes)
+	var remEnc [4]byte
+	nRem := encodeVarInt(remEnc[:], remaining)
+	out := make([]byte, 0, 1+nRem+remaining)
+	out = append(out, byte(UNSUBACK)<<4)
+	out = append(out, remEnc[:nRem]...)
+	out = appendUint16(out, packetID)
+	out = append(out, propLenEnc[:nProp]...)
+	out = append(out, props...)
+	out = append(out, reasonCodes...)
+	return out
 }
 
 // ─── PINGRESP ─────────────────────────────────────────────────────────────────

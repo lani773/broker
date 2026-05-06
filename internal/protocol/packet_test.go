@@ -1,6 +1,10 @@
 package protocol
 
-import "testing"
+import (
+	"bytes"
+	"io"
+	"testing"
+)
 
 func TestDecodePublishV5Properties(t *testing.T) {
 	// topic "a/b", packet id 10, properties:
@@ -67,5 +71,86 @@ func TestEncodeConnackV5TopicAliasMax(t *testing.T) {
 	b := EncodeConnackV5(true, ConnAccepted, 64)
 	if len(b) < 8 {
 		t.Fatalf("CONNACK v5 too short: %d", len(b))
+	}
+}
+
+func TestEncodePublishV5RoundTrip(t *testing.T) {
+	topic := "sensors/temp"
+	payload := []byte("22.5")
+	raw := EncodePublishV5(topic, payload, 1, false, 99, false, nil)
+	r := bytes.NewReader(raw)
+	fh, err := ReadFixed(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, fh.RemainingLength)
+	if _, err := io.ReadFull(r, body); err != nil {
+		t.Fatal(err)
+	}
+	pkt, err := DecodePublish(V50, fh, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Topic != topic || string(pkt.Payload) != string(payload) || pkt.QoS != 1 || pkt.PacketID != 99 {
+		t.Fatalf("decoded mismatch: %+v", pkt)
+	}
+}
+
+func TestDecodeSubscribeV5SkipsProperties(t *testing.T) {
+	body := []byte{
+		0x00, 0x05, // packet id 5
+		0x00,             // properties length 0
+		0x00, 0x03, 'a', '/', 'b',
+		0x02, // v5 subscription options: max QoS 2
+	}
+	id, subs, err := DecodeSubscribe(V50, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 5 || len(subs) != 1 || subs[0].Filter != "a/b" || subs[0].QoS != 2 {
+		t.Fatalf("got id=%d subs=%+v", id, subs)
+	}
+}
+
+func TestDecodeSubscribeV311NoPropertySection(t *testing.T) {
+	body := []byte{
+		0x00, 0x03,
+		0x00, 0x01, 'x',
+		0x01,
+	}
+	id, subs, err := DecodeSubscribe(V311, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 3 || len(subs) != 1 || subs[0].Filter != "x" || subs[0].QoS != 1 {
+		t.Fatalf("got %+v", subs)
+	}
+}
+
+func TestEncodeSubackV5DecodeReasons(t *testing.T) {
+	codes := []byte{0x01, 0x00}
+	b := EncodeSubackV5(7, nil, codes)
+	br := bytes.NewReader(b)
+	fh, err := ReadFixed(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest := make([]byte, fh.RemainingLength)
+	if _, err := io.ReadFull(br, rest); err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) < 2+1+len(codes) {
+		t.Fatalf("short body: %d", len(rest))
+	}
+	if uint16(rest[0])<<8|uint16(rest[1]) != 7 {
+		t.Fatalf("packet id")
+	}
+	if rest[2] != 0x00 {
+		t.Fatalf("prop len should be 0, got %x", rest[2])
+	}
+	for i := range codes {
+		if rest[3+i] != codes[i] {
+			t.Fatalf("code %d", i)
+		}
 	}
 }
