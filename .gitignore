@@ -1,0 +1,10 @@
+# Binaries / local builds
+/broker.exe
+*.exe
+
+# Secrets / local overrides (keep .env.example tracked)
+.env
+.env.local
+
+# Go
+vendor/
