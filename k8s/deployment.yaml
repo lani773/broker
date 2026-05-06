@@ -1,0 +1,450 @@
+---
+# ─── LUMA MQTT Broker v2 – Kubernetes Manifests ──────────────────────────────
+# Single Go binary per pod: MQTT :1883, API :8080, Metrics :9090
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: luma
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/part-of: luma-mqtt
+
+---
+# ─── ConfigMap ────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: luma-config
+  namespace: luma
+data:
+  LOG_LEVEL:          "info"
+  LOG_FORMAT:         "json"
+  MQTT_TCP_ADDR:      ":1883"
+  MQTT_TLS_ADDR:      ":8883"
+  MQTT_WS_ADDR:       ":8083"
+  MQTT_WS_ENABLED:    "true"
+  MQTT_QUIC_ADDR:     ":1884"
+  MQTT_QUIC_ENABLED:  "false"
+  API_ADDR:           ":8080"
+  API_ALLOWED_ORIGINS: "https://api.luma.example.com"
+  METRICS_ADDR:       ":9090"
+  METRICS_ENABLED:    "true"
+  MAX_CONNECTIONS:    "50000"
+  WRITE_QUEUE_SIZE:   "512"
+  MAX_PACKET_SIZE:    "10485760"
+  SYS_INTERVAL:       "10s"
+  PING_GRACE:         "1.5"
+  REDIS_ADDR:         "redis-master.luma.svc.cluster.local:6379"
+  REDIS_POOL_SIZE:    "50"
+  REDIS_MIN_IDLE:     "10"
+  PG_MAX_CONNS:       "25"
+  PG_MIN_CONNS:       "5"
+  JWT_DURATION:       "24h"
+  JWT_ISSUER:         "luma-broker"
+  BCRYPT_COST:        "12"
+  RATE_LIMIT:         "1000"
+  RATE_BURST:         "2000"
+  CLUSTER_MODE:       "true"
+  CLUSTER_PARTITIONS: "256"
+  CLUSTER_REPLICAS:   "3"
+  SLO_TARGET_MESSAGES_PER_SEC: "1000000"
+  SLO_TARGET_P99_MS:           "50"
+  SLO_TARGET_CONNECTIONS:      "100000000"
+  SLO_FAILOVER_RTO_SECONDS:    "60"
+  SLO_FAILOVER_RPO_SECONDS:    "10"
+  SLO_ERROR_BUDGET_PERCENT:    "0.1"
+
+---
+# ─── Secrets (use SealedSecrets or Vault in production) ──────────────────────
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: luma-secrets
+  namespace: luma
+type: Opaque
+stringData:
+  JWT_SECRET:         "REPLACE_WITH_32_PLUS_RANDOM_BYTES"
+  ADMIN_PASSWORD:     "REPLACE_WITH_STRONG_PASSWORD"
+  REDIS_PASSWORD:     ""
+  POSTGRES_DSN:       "postgres://mqtt:REPLACE_PASSWORD@postgres.luma.svc.cluster.local:5432/mqtt?sslmode=require"
+
+---
+# ─── MQTT Broker Deployment ───────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: luma-broker
+  namespace: luma
+  labels:
+    app:       luma-broker
+    component: broker
+    version:   v2
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: luma-broker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge:       1
+      maxUnavailable: 0   # zero downtime
+  template:
+    metadata:
+      labels:
+        app:       luma-broker
+        component: broker
+        version:   v2
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "9090"
+        prometheus.io/path:   "/metrics"
+    spec:
+      # Spread pods across nodes for HA
+      topologySpreadConstraints:
+        - maxSkew:           1
+          topologyKey:       kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: luma-broker
+
+      # Graceful shutdown: 30s drain window
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: broker
+          image: ghcr.io/your-org/luma-broker:latest
+          imagePullPolicy: Always
+          ports:
+            - name: mqtt
+              containerPort: 1883
+              protocol: TCP
+            - name: mqtts
+              containerPort: 8883
+              protocol: TCP
+            - name: api
+              containerPort: 8080
+              protocol: TCP
+            - name: mqttws
+              containerPort: 8083
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: luma-config
+            - secretRef:
+                name: luma-secrets
+
+          # Liveness: broker process alive
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds:       20
+            failureThreshold:    3
+            timeoutSeconds:      5
+
+          # Readiness: only send traffic when healthy
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds:       10
+            failureThreshold:    2
+            timeoutSeconds:      3
+
+          # Startup: extra time during initial DB migration
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold:    30
+            periodSeconds:       5
+
+          resources:
+            requests:
+              cpu:    "500m"
+              memory: "256Mi"
+            limits:
+              cpu:    "4"
+              memory: "2Gi"
+
+          securityContext:
+            runAsNonRoot:             true
+            runAsUser:                65534
+            runAsGroup:               65534
+            readOnlyRootFilesystem:   true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          # Graceful shutdown hook
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+
+      # No service account needed (broker doesn't call k8s API)
+      automountServiceAccountToken: false
+
+---
+# ─── MQTT Service (LoadBalancer for external MQTT clients) ───────────────────
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: luma-mqtt
+  namespace: luma
+  labels:
+    app: luma-broker
+  annotations:
+    # Cloud-specific: request a static IP
+    # GKE:  cloud.google.com/load-balancer-type: "External"
+    # AWS:  service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  type: LoadBalancer
+  selector:
+    app: luma-broker
+  ports:
+    - name: mqtt
+      port: 1883
+      targetPort: mqtt
+      protocol: TCP
+    - name: mqtts
+      port: 8883
+      targetPort: mqtts
+      protocol: TCP
+    - name: mqttws
+      port: 8083
+      targetPort: mqttws
+      protocol: TCP
+  # Sticky sessions: keep MQTT persistent connections on the same pod
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+
+---
+# ─── API Service (ClusterIP — exposed via Ingress) ────────────────────────────
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: luma-api
+  namespace: luma
+  labels:
+    app: luma-broker
+spec:
+  type: ClusterIP
+  selector:
+    app: luma-broker
+  ports:
+    - name: http
+      port: 8080
+      targetPort: api
+
+---
+# ─── Metrics Service (for Prometheus ServiceMonitor) ─────────────────────────
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: luma-metrics
+  namespace: luma
+  labels:
+    app:  luma-broker
+    role: metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: luma-broker
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+
+---
+# ─── Ingress (REST API + WebSocket) ──────────────────────────────────────────
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: luma-api
+  namespace: luma
+  annotations:
+    kubernetes.io/ingress.class:                        "nginx"
+    cert-manager.io/cluster-issuer:                     "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/proxy-read-timeout:     "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout:     "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size:        "10m"
+    # WebSocket upgrade headers
+    nginx.ingress.kubernetes.io/proxy-http-version:     "1.1"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade    $http_upgrade;
+      proxy_set_header Connection "upgrade";
+spec:
+  tls:
+    - hosts:
+        - api.luma.example.com
+      secretName: luma-api-tls
+  rules:
+    - host: api.luma.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: luma-api
+                port:
+                  number: 8080
+
+---
+# ─── Horizontal Pod Autoscaler ────────────────────────────────────────────────
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: luma-broker-hpa
+  namespace: luma
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: luma-broker
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type:               Utilization
+          averageUtilization: 65
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type:               Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type:          Pods
+          value:         4
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 120  # prevent flapping
+      policies:
+        - type:          Pods
+          value:         2
+          periodSeconds: 60
+
+---
+# ─── Pod Disruption Budget ────────────────────────────────────────────────────
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: luma-broker-pdb
+  namespace: luma
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: luma-broker
+
+---
+# ─── NetworkPolicy (deny-all baseline + explicit allow) ──────────────────────
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: luma-broker-netpol
+  namespace: luma
+spec:
+  podSelector:
+    matchLabels:
+      app: luma-broker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow MQTT from anywhere
+    - ports:
+        - port: 1883
+        - port: 8883
+    # Allow API from anywhere
+    - ports:
+        - port: 8080
+    # Allow Prometheus scrape from monitoring namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - port: 9090
+    # Allow broker-to-broker (cluster mode)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: luma-broker
+  egress:
+    # Allow DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Allow outbound to Redis
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: luma
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+    # Allow outbound to PostgreSQL
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: luma
+        - podSelector:
+            matchLabels:
+              app: postgresql
+      ports:
+        - port: 5432
+
+---
+# ─── Prometheus ServiceMonitor (for kube-prometheus-stack) ───────────────────
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: luma-broker
+  namespace: luma
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app:  luma-broker
+      role: metrics
+  endpoints:
+    - port:          metrics
+      path:          /metrics
+      interval:      15s
+      scrapeTimeout: 10s
