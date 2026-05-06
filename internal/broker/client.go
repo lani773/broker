@@ -163,7 +163,11 @@ func (c *Client) handle(fh protocol.FixedHeader, body []byte) error {
 	if c.clientID != "" && !c.broker.rateLimiter.Allow(c.clientID) {
 		metrics.DroppedTotal.WithLabelValues("rate_limit").Inc()
 		c.logger.Warn("rate limit", zap.String("client", c.clientID))
-		c.enqueue([]byte{byte(protocol.DISCONNECT) << 4, 2, protocol.ReasonQuotaExceeded, 0})
+		if c.version == protocol.V50 {
+			c.enqueue(protocol.EncodeDisconnectV5(protocol.ReasonQuotaExceeded, nil))
+		} else {
+			c.enqueue(protocol.EncodeDisconnectV311())
+		}
 		return fmt.Errorf("rate limited")
 	}
 

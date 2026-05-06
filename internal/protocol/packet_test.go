@@ -248,6 +248,29 @@ func TestDecodeSubscribeV311NoPropertySection(t *testing.T) {
 	}
 }
 
+func TestEncodeDisconnectV311(t *testing.T) {
+	b := EncodeDisconnectV311()
+	if len(b) != 2 || b[0] != byte(DISCONNECT)<<4 || b[1] != 0 {
+		t.Fatalf("v311 DISCONNECT: % x", b)
+	}
+}
+
+func TestEncodeDisconnectV5QuotaReason(t *testing.T) {
+	b := EncodeDisconnectV5(ReasonQuotaExceeded, nil)
+	r := bytes.NewReader(b)
+	fh, err := ReadFixed(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, fh.RemainingLength)
+	if _, err := io.ReadFull(r, body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) < 2 || body[0] != ReasonQuotaExceeded || body[1] != 0 {
+		t.Fatalf("DISCONNECT v5 body: % x", body)
+	}
+}
+
 func TestEncodeSubackV5DecodeReasons(t *testing.T) {
 	codes := []byte{0x01, 0x00}
 	b := EncodeSubackV5(7, nil, codes)

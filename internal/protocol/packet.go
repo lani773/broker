@@ -863,6 +863,27 @@ func EncodeUnsubackV5(packetID uint16, props []byte, reasonCodes []byte) []byte 
 // Pingresp is a static 2-byte PINGRESP packet (shared, never mutated).
 var Pingresp = []byte{byte(PINGRESP) << 4, 0}
 
+// EncodeDisconnectV311 returns an MQTT v3.1.1 DISCONNECT (no variable header).
+func EncodeDisconnectV311() []byte {
+	return []byte{byte(DISCONNECT) << 4, 0}
+}
+
+// EncodeDisconnectV5 builds MQTT v5 DISCONNECT with Reason Code and Property Length + props.
+func EncodeDisconnectV5(reasonCode byte, props []byte) []byte {
+	var propLenEnc [4]byte
+	nProp := encodeVarInt(propLenEnc[:], len(props))
+	rem := 1 + nProp + len(props)
+	var remEnc [4]byte
+	nRem := encodeVarInt(remEnc[:], rem)
+	out := make([]byte, 0, 1+nRem+rem)
+	out = append(out, byte(DISCONNECT)<<4)
+	out = append(out, remEnc[:nRem]...)
+	out = append(out, reasonCode)
+	out = append(out, propLenEnc[:nProp]...)
+	out = append(out, props...)
+	return out
+}
+
 // ─── Topic Validation ─────────────────────────────────────────────────────────
 
 // ValidTopicName checks that a PUBLISH topic contains no wildcards.
