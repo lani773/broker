@@ -884,6 +884,44 @@ func EncodeDisconnectV5(reasonCode byte, props []byte) []byte {
 	return out
 }
 
+// DisconnectPacket is the MQTT v5 DISCONNECT variable header (v3.1.1 has no payload).
+type DisconnectPacket struct {
+	ReasonCode byte
+	// SessionExpiryInterval is set from property 0x11 when present (seconds).
+	SessionExpiryInterval uint32
+}
+
+// DecodeDisconnect parses DISCONNECT payload after the fixed header.
+// MQTT v3.1.1 requires an empty remaining length; MQTT v5 allows Reason Code + properties or empty (normal disconnect).
+func DecodeDisconnect(version byte, body []byte) (*DisconnectPacket, error) {
+	if version != V50 {
+		if len(body) != 0 {
+			return nil, ErrProtocolViolation
+		}
+		return &DisconnectPacket{ReasonCode: ReasonSuccess}, nil
+	}
+	if len(body) == 0 {
+		return &DisconnectPacket{ReasonCode: ReasonSuccess}, nil
+	}
+	r := newSliceReader(body)
+	var rc [1]byte
+	if _, err := r.Read(rc[:]); err != nil {
+		return nil, err
+	}
+	pkt := &DisconnectPacket{ReasonCode: rc[0]}
+	props, err := readProps(r)
+	if err != nil {
+		return nil, err
+	}
+	if r.Remaining() != 0 {
+		return nil, ErrMalformed
+	}
+	if v, ok := props[0x11]; ok && len(v) == 4 {
+		pkt.SessionExpiryInterval = binary.BigEndian.Uint32(v)
+	}
+	return pkt, nil
+}
+
 // ─── Topic Validation ─────────────────────────────────────────────────────────
 
 // ValidTopicName checks that a PUBLISH topic contains no wildcards.
@@ -1051,6 +1089,12 @@ func readProps(r *sliceReader) (map[byte][]byte, error) {
 			}
 			props[id] = append([]byte(nil), r.data[r.pos:r.pos+2]...)
 			r.pos += 2
+		case 0x11: // session expiry interval (DISCONNECT, CONNECT)
+			if r.Remaining() < 4 {
+				return nil, ErrMalformed
+			}
+			props[id] = append([]byte(nil), r.data[r.pos:r.pos+4]...)
+			r.pos += 4
 		default:
 			// Unknown property: skip the remainder as compatibility fallback.
 			r.pos = start + propLen

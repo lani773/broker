@@ -271,6 +271,44 @@ func TestEncodeDisconnectV5QuotaReason(t *testing.T) {
 	}
 }
 
+func mqttPacketBody(t *testing.T, full []byte) []byte {
+	t.Helper()
+	r := bytes.NewReader(full)
+	fh, err := ReadFixed(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, fh.RemainingLength)
+	if _, err := io.ReadFull(r, body); err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func TestDecodeDisconnectV5RoundTrip(t *testing.T) {
+	props := []byte{0x11, 0x00, 0x00, 0x00, 0x3c}
+	full := EncodeDisconnectV5(ReasonSuccess, props)
+	pkt, err := DecodeDisconnect(V50, mqttPacketBody(t, full))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.ReasonCode != ReasonSuccess || pkt.SessionExpiryInterval != 60 {
+		t.Fatalf("got %+v", pkt)
+	}
+}
+
+func TestDecodeDisconnectV311RejectsPayload(t *testing.T) {
+	if _, err := DecodeDisconnect(V311, []byte{0x00}); err == nil {
+		t.Fatal("expected protocol violation")
+	}
+}
+
+func TestDecodeDisconnectV50Truncated(t *testing.T) {
+	if _, err := DecodeDisconnect(V50, []byte{0x04}); err == nil {
+		t.Fatal("expected malformed (missing property length)")
+	}
+}
+
 func TestEncodeSubackV5DecodeReasons(t *testing.T) {
 	codes := []byte{0x01, 0x00}
 	b := EncodeSubackV5(7, nil, codes)

@@ -193,11 +193,25 @@ func (c *Client) handle(fh protocol.FixedHeader, body []byte) error {
 		c.sess.Touch()
 		return nil
 	case protocol.DISCONNECT:
-		c.sess.WillSet = false // graceful disconnect — suppress LWT
-		return fmt.Errorf("graceful disconnect")
+		return c.handleDisconnect(body)
 	default:
 		return fmt.Errorf("unexpected packet type: %s", fh.Type)
 	}
+}
+
+func (c *Client) handleDisconnect(body []byte) error {
+	pkt, err := protocol.DecodeDisconnect(c.version, body)
+	if err != nil {
+		return err
+	}
+	if c.sess != nil {
+		c.sess.WillSet = false // graceful disconnect — suppress LWT
+	}
+	c.logger.Debug("mqtt disconnect",
+		zap.String("client", c.clientID),
+		zap.Uint8("reason_code", pkt.ReasonCode),
+		zap.Uint32("session_expiry_interval_sec", pkt.SessionExpiryInterval))
+	return fmt.Errorf("graceful disconnect")
 }
 
 // ─── CONNECT ─────────────────────────────────────────────────────────────────
