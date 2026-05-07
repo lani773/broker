@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const mqttProtoV50 byte = 5 // MQTT v5 protocol level byte
+
 // ─── QoS 2 State ─────────────────────────────────────────────────────────────
 
 type QoS2Phase int8
@@ -57,6 +59,11 @@ type Session struct {
 	connectedAt time.Time
 	lastSeen    time.Time
 	keepAlive   uint16
+
+	// MQTT v5 persistent-session expiry (ignored for clean sessions / v3.1.1 scheduling).
+	protocolLevel    byte
+	sessionExpirySec uint32
+	disconnectExpireAt time.Time // non-zero ⇒ sweep removes session after wall-clock deadline
 
 	// Last Will
 	WillTopic   string
@@ -125,6 +132,66 @@ func (s *Session) SetKeepAlive(ka uint16) {
 	s.mu.Unlock()
 }
 
+// ClearDisconnectExpiry clears a pending disconnected-session expiry deadline (on reconnect).
+func (s *Session) ClearDisconnectExpiry() {
+	s.mu.Lock()
+	s.disconnectExpireAt = time.Time{}
+	s.mu.Unlock()
+}
+
+// SetProtocolAndExpiry stores the negotiated MQTT protocol level and v5 session expiry interval from CONNECT.
+func (s *Session) SetProtocolAndExpiry(version byte, cleanSession bool, sessionExpirySec uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.protocolLevel = version
+	if version == mqttProtoV50 && !cleanSession {
+		s.sessionExpirySec = sessionExpirySec
+		return
+	}
+	if cleanSession {
+		s.sessionExpirySec = 0
+		s.disconnectExpireAt = time.Time{}
+	}
+}
+
+// UpdateSessionExpiryFromDisconnect applies MQTT v5 Session Expiry Interval from DISCONNECT (property present).
+func (s *Session) UpdateSessionExpiryFromDisconnect(sec uint32) {
+	s.mu.Lock()
+	s.sessionExpirySec = sec
+	s.mu.Unlock()
+}
+
+// PrepareDisconnectExpiry schedules expiry after disconnect for MQTT v5 persistent sessions.
+// Returns true when the session must be purged immediately (interval 0).
+func (s *Session) PrepareDisconnectExpiry(now time.Time) (purgeImmediate bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.CleanSession || s.protocolLevel != mqttProtoV50 {
+		return false
+	}
+	switch s.sessionExpirySec {
+	case 0:
+		s.disconnectExpireAt = time.Time{}
+		return true
+	case ^uint32(0):
+		s.disconnectExpireAt = time.Time{}
+		return false
+	default:
+		s.disconnectExpireAt = now.Add(time.Duration(s.sessionExpirySec) * time.Second)
+		return false
+	}
+}
+
+// ShouldExpireDisconnected reports whether a disconnected persistent session passed its expiry deadline.
+func (s *Session) ShouldExpireDisconnected(now time.Time) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.connected || s.CleanSession {
+		return false
+	}
+	return !s.disconnectExpireAt.IsZero() && !now.Before(s.disconnectExpireAt)
+}
+
 func (s *Session) Info() (connectedAt, lastSeen time.Time, connected bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -156,6 +223,29 @@ func (s *Session) AddOutFlight(msg *InFlight) {
 	s.outMu.Lock()
 	s.outFlight[msg.PacketID] = msg
 	s.outMu.Unlock()
+}
+
+// AddOutFlightLimited adds an outbound QoS>0 publish respecting the client's Receive Maximum (0 = unlimited).
+// QoS 0 messages are not tracked in outFlight and always succeed.
+func (s *Session) AddOutFlightLimited(msg *InFlight, receiveMax uint16) bool {
+	if msg.QoS == 0 {
+		return true
+	}
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if receiveMax > 0 {
+		n := 0
+		for _, m := range s.outFlight {
+			if m.QoS > 0 {
+				n++
+			}
+		}
+		if n >= int(receiveMax) {
+			return false
+		}
+	}
+	s.outFlight[msg.PacketID] = msg
+	return true
 }
 
 func (s *Session) GetOutFlight(id uint16) *InFlight {

@@ -320,7 +320,12 @@ type ConnectPacket struct {
 	Version               byte
 	CleanSession          bool
 	KeepAlive             uint16
-	SessionExpiryInterval uint32
+	SessionExpiryInterval uint32 // MQTT v5 property 0x11 (missing defaults to 0)
+
+	// MQTT v5 optional CONNECT properties (0 = absent / default).
+	ReceiveMaximum      uint16 // 0x21 absent → unlimited for outbound QoS from broker
+	MaximumPacketSize   uint32 // 0x27 absent → unlimited inbound packet size from client POV
+	TopicAliasMaximum   uint16 // 0x22 optional client limit for broker-assigned aliases
 
 	// Flags
 	WillFlag    bool
@@ -400,6 +405,21 @@ func DecodeConnect(body []byte) (*ConnectPacket, error) {
 		}
 		if v, ok := props[0x11]; ok && len(v) == 4 {
 			pkt.SessionExpiryInterval = binary.BigEndian.Uint32(v)
+		}
+		if v, ok := props[0x21]; ok && len(v) == 2 {
+			pkt.ReceiveMaximum = binary.BigEndian.Uint16(v)
+			if pkt.ReceiveMaximum == 0 {
+				return nil, ErrProtocolViolation
+			}
+		}
+		if v, ok := props[0x27]; ok && len(v) == 4 {
+			pkt.MaximumPacketSize = binary.BigEndian.Uint32(v)
+			if pkt.MaximumPacketSize == 0 {
+				return nil, ErrProtocolViolation
+			}
+		}
+		if v, ok := props[0x22]; ok && len(v) == 2 {
+			pkt.TopicAliasMaximum = binary.BigEndian.Uint16(v)
 		}
 	}
 
@@ -520,14 +540,61 @@ func EncodeConnack(sessionPresent bool, code byte) []byte {
 
 // EncodeConnackV5 builds a MQTT v5 CONNACK with optional Topic Alias Maximum (0x22) on Success only.
 // Session Present must be 0 when Reason Code is not Success (MQTT v5).
-func EncodeConnackV5(sessionPresent bool, reasonCode byte, topicAliasMax uint16) []byte {
+// ConnackMQTT5Options lists MQTT v5 CONNACK properties advertised on success.
+type ConnackMQTT5Options struct {
+	TopicAliasMax                 uint16
+	ReceiveMaximum                uint16 // server-side receive maximum (limit client's QoS>0 publishes); 0 = omit (unlimited)
+	MaximumQoS                    byte   // 0–2; typically omit when 2
+	MaxPacketSize                 uint32 // server maximum packet size; 0 = omit
+	RetainAvailable               bool
+	WildcardSubscriptionAvailable bool
+	SubscriptionIDAvailable       bool
+	SharedSubscriptionAvailable   bool
+}
+
+// EncodeConnackV5 builds a MQTT v5 CONNACK using ConnackMQTT5Options (ignored when reasonCode != success).
+func EncodeConnackV5(sessionPresent bool, reasonCode byte, opts ConnackMQTT5Options) []byte {
 	flags := byte(0)
 	if reasonCode == ConnAccepted && sessionPresent {
 		flags = 0x01
 	}
 	var props []byte
-	if reasonCode == ConnAccepted && topicAliasMax > 0 {
-		props = append(props, 0x22, byte(topicAliasMax>>8), byte(topicAliasMax))
+	if reasonCode == ConnAccepted {
+		if opts.ReceiveMaximum > 0 {
+			rm := opts.ReceiveMaximum
+			props = append(props, 0x21, byte(rm>>8), byte(rm))
+		}
+		if opts.MaximumQoS < 2 {
+			props = append(props, 0x24, opts.MaximumQoS&0x03)
+		}
+		if opts.MaxPacketSize > 0 {
+			ps := opts.MaxPacketSize
+			props = append(props, 0x27,
+				byte(ps>>24), byte(ps>>16), byte(ps>>8), byte(ps))
+		}
+		if opts.TopicAliasMax > 0 {
+			props = append(props, 0x22, byte(opts.TopicAliasMax>>8), byte(opts.TopicAliasMax))
+		}
+		rb := byte(0)
+		if opts.RetainAvailable {
+			rb = 1
+		}
+		props = append(props, 0x25, rb)
+		wb := byte(0)
+		if opts.WildcardSubscriptionAvailable {
+			wb = 1
+		}
+		props = append(props, 0x28, wb)
+		sb := byte(0)
+		if opts.SubscriptionIDAvailable {
+			sb = 1
+		}
+		props = append(props, 0x29, sb)
+		sh := byte(0)
+		if opts.SharedSubscriptionAvailable {
+			sh = 1
+		}
+		props = append(props, 0x2A, sh)
 	}
 	var propLenEnc [4]byte
 	nProp := encodeVarInt(propLenEnc[:], len(props))
@@ -889,6 +956,7 @@ type DisconnectPacket struct {
 	ReasonCode byte
 	// SessionExpiryInterval is set from property 0x11 when present (seconds).
 	SessionExpiryInterval uint32
+	HasSessionExpiryProp bool
 }
 
 // DecodeDisconnect parses DISCONNECT payload after the fixed header.
@@ -918,8 +986,24 @@ func DecodeDisconnect(version byte, body []byte) (*DisconnectPacket, error) {
 	}
 	if v, ok := props[0x11]; ok && len(v) == 4 {
 		pkt.SessionExpiryInterval = binary.BigEndian.Uint32(v)
+		pkt.HasSessionExpiryProp = true
 	}
 	return pkt, nil
+}
+
+// ApproxClientOutboundPublishBytes estimates encoded size of a broker→client PUBLISH (fixed header upper bound).
+func ApproxClientOutboundPublishBytes(version byte, topic string, payloadLen int, qos byte) int {
+	topicLen := 2 + len(topic)
+	pidLen := 0
+	if qos > 0 {
+		pidLen = 2
+	}
+	propSection := 0
+	if version == V50 {
+		propSection = 1 // property length varint minimum for empty properties
+	}
+	rem := topicLen + pidLen + propSection + payloadLen
+	return 1 + 4 + rem // fixed header + worst-case remaining-length + variable header + payload
 }
 
 // ─── Topic Validation ─────────────────────────────────────────────────────────
@@ -1119,6 +1203,24 @@ func readConnectProps(r *sliceReader) (map[byte][]byte, error) {
 		r.pos++
 		switch id {
 		case 0x11: // session expiry interval
+			if r.Remaining() < 4 {
+				return nil, ErrMalformed
+			}
+			props[id] = append([]byte(nil), r.data[r.pos:r.pos+4]...)
+			r.pos += 4
+		case 0x21: // receive maximum
+			if r.Remaining() < 2 {
+				return nil, ErrMalformed
+			}
+			props[id] = append([]byte(nil), r.data[r.pos:r.pos+2]...)
+			r.pos += 2
+		case 0x22: // topic alias maximum
+			if r.Remaining() < 2 {
+				return nil, ErrMalformed
+			}
+			props[id] = append([]byte(nil), r.data[r.pos:r.pos+2]...)
+			r.pos += 2
+		case 0x27: // maximum packet size
 			if r.Remaining() < 4 {
 				return nil, ErrMalformed
 			}

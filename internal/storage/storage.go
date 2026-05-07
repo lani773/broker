@@ -484,6 +484,11 @@ type SubRecord struct {
 	QoS    byte
 }
 
+func (p *Postgres) DeleteAllSubs(ctx context.Context, clientID string) error {
+	_, err := p.pool.Exec(ctx, "DELETE FROM subscriptions WHERE client_id=$1", clientID)
+	return err
+}
+
 func (p *Postgres) GetSubs(ctx context.Context, clientID string) ([]SubRecord, error) {
 	rows, err := p.pool.Query(ctx, "SELECT topic_filter,qos FROM subscriptions WHERE client_id=$1", clientID)
 	if err != nil {

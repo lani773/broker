@@ -69,7 +69,15 @@ func TestDecodePublishV5EmptyTopicUsesAlias(t *testing.T) {
 }
 
 func TestEncodeConnackV5TopicAliasMax(t *testing.T) {
-	b := EncodeConnackV5(true, ConnAccepted, 64)
+	b := EncodeConnackV5(true, ConnAccepted, ConnackMQTT5Options{
+		TopicAliasMax:                 64,
+		ReceiveMaximum:                65535,
+		MaxPacketSize:                 8192,
+		RetainAvailable:               true,
+		WildcardSubscriptionAvailable: true,
+		SubscriptionIDAvailable:       true,
+		SharedSubscriptionAvailable:   true,
+	})
 	if len(b) < 8 {
 		t.Fatalf("CONNACK v5 too short: %d", len(b))
 	}
@@ -77,10 +85,13 @@ func TestEncodeConnackV5TopicAliasMax(t *testing.T) {
 	if bytes.Index(b, []byte{0x22, 0x00, 0x40}) < 0 {
 		t.Fatal("missing Topic Alias Maximum property")
 	}
+	if bytes.Index(b, []byte{0x21}) < 0 {
+		t.Fatal("missing Receive Maximum property")
+	}
 }
 
 func TestEncodeConnackV5FailureOmitsTopicAliasAndSessionPresent(t *testing.T) {
-	b := EncodeConnackV5(true, ConnackReasonV5BadUsernameOrPassword, 99)
+	b := EncodeConnackV5(true, ConnackReasonV5BadUsernameOrPassword, ConnackMQTT5Options{TopicAliasMax: 99})
 	if bytes.Contains(b, []byte{0x22}) {
 		t.Fatal("Topic Alias property must not be sent on CONNACK failure")
 	}

@@ -70,6 +70,11 @@ type Client struct {
 	topicAliasMu sync.RWMutex
 	topicAliases map[uint16]string
 
+	// MQTT v5 negotiated limits (from CONNECT)
+	peerRecvMax               uint16 // client's Receive Maximum; 0 = unlimited
+	peerMaxPacketSize         uint32 // client's Maximum Packet Size; 0 = unlimited
+	negotiatedTopicAliasMax   uint16 // min(server cfg, client's Topic Alias Maximum)
+
 	// Metrics
 	rxPackets atomic.Uint64
 	txPackets atomic.Uint64
@@ -117,13 +122,7 @@ func (c *Client) readLoop(ctx context.Context) {
 			return
 		}
 
-		// Must receive CONNECT as the very first packet
-		if c.state.Load() == int32(stateHandshaking) && fh.Type != protocol.CONNECT {
-			c.logger.Warn("expected CONNECT", zap.String("type", fh.Type.String()))
-			return
-		}
-
-		// Read body
+		// Read body (always drain remaining length before rejecting handshake packets).
 		var body []byte
 		if fh.RemainingLength > 0 {
 			if fh.RemainingLength > c.cfg.MaxPacketSize {
@@ -135,6 +134,11 @@ func (c *Client) readLoop(ctx context.Context) {
 				c.logger.Debug("body read error", zap.Error(err))
 				return
 			}
+		}
+
+		if c.state.Load() == int32(stateHandshaking) && fh.Type != protocol.CONNECT {
+			c.logger.Warn("expected CONNECT", zap.String("type", fh.Type.String()))
+			return
 		}
 
 		c.rxPackets.Add(1)
@@ -206,6 +210,9 @@ func (c *Client) handleDisconnect(body []byte) error {
 	}
 	if c.sess != nil {
 		c.sess.WillSet = false // graceful disconnect — suppress LWT
+		if pkt.HasSessionExpiryProp {
+			c.sess.UpdateSessionExpiryFromDisconnect(pkt.SessionExpiryInterval)
+		}
 	}
 	c.logger.Debug("mqtt disconnect",
 		zap.String("client", c.clientID),
@@ -226,7 +233,7 @@ func (c *Client) sendConnackFailure(reasonV311, reasonV5 byte, peekBody []byte) 
 		}
 	}
 	if useV5 {
-		c.enqueue(protocol.EncodeConnackV5(false, reasonV5, 0))
+		c.enqueue(protocol.EncodeConnackV5(false, reasonV5, protocol.ConnackMQTT5Options{}))
 		return
 	}
 	c.enqueue(protocol.EncodeConnack(false, reasonV311))
@@ -294,6 +301,26 @@ func (c *Client) handleConnect(body []byte) error {
 	sess, present := c.broker.sessions.GetOrCreate(cid, pkt.CleanSession)
 	c.sess = sess
 
+	sess.ClearDisconnectExpiry()
+	expirySec := uint32(0)
+	if pkt.Version == protocol.V50 {
+		expirySec = pkt.SessionExpiryInterval
+	}
+	sess.SetProtocolAndExpiry(pkt.Version, pkt.CleanSession, expirySec)
+
+	c.peerRecvMax = 0
+	c.peerMaxPacketSize = 0
+	c.negotiatedTopicAliasMax = uint16(c.broker.cfg.Broker.TopicAliasMax)
+	if pkt.Version == protocol.V50 {
+		c.peerRecvMax = pkt.ReceiveMaximum
+		c.peerMaxPacketSize = pkt.MaximumPacketSize
+		ta := uint16(c.broker.cfg.Broker.TopicAliasMax)
+		if pkt.TopicAliasMaximum > 0 && (ta == 0 || pkt.TopicAliasMaximum < ta) {
+			ta = pkt.TopicAliasMaximum
+		}
+		c.negotiatedTopicAliasMax = ta
+	}
+
 	if pkt.WillFlag {
 		sess.WillTopic = pkt.WillTopic
 		sess.WillPayload = pkt.WillPayload
@@ -337,7 +364,8 @@ func (c *Client) handleConnect(body []byte) error {
 	)
 
 	if c.version == protocol.V50 {
-		c.enqueue(protocol.EncodeConnackV5(present, protocol.ConnAccepted, uint16(c.broker.cfg.Broker.TopicAliasMax)))
+		opts := connackV5FromConfig(&c.broker.cfg.Broker, c.negotiatedTopicAliasMax)
+		c.enqueue(protocol.EncodeConnackV5(present, protocol.ConnAccepted, opts))
 	} else {
 		c.enqueue(protocol.EncodeConnack(present, protocol.ConnAccepted))
 	}
@@ -358,7 +386,7 @@ func (c *Client) resolvePublishTopic(pkt *protocol.PublishPacket) (string, error
 		return pkt.Topic, nil
 	}
 	topic := pkt.Topic
-	max := uint16(c.broker.cfg.Broker.TopicAliasMax)
+	max := c.negotiatedTopicAliasMax
 	if pkt.TopicAlias > 0 && max > 0 && pkt.TopicAlias > max {
 		return "", protocol.ErrProtocolViolation
 	}
@@ -519,9 +547,17 @@ func (c *Client) handleSubscribe(body []byte) error {
 		return err
 	}
 
+	srvMaxQoS := byte(c.broker.cfg.Broker.ServerMaximumQoS)
+	if srvMaxQoS > protocol.QoS2 {
+		srvMaxQoS = protocol.QoS2
+	}
+
 	codes := make([]byte, len(subs))
 	for i, sub := range subs {
-		qos := sub.QoS
+		qos := sub.QoS & 0x03
+		if qos > srvMaxQoS {
+			qos = srvMaxQoS
+		}
 		aclFilter := sub.Filter
 		if _, inner, ok := protocol.ParseSharedTopicFilter(sub.Filter); ok {
 			aclFilter = inner
@@ -621,7 +657,7 @@ func (c *Client) handleUnsubscribe(body []byte) error {
 // Delivery is non-blocking: offline clients queue for persistent sessions.
 func (c *Client) makeDeliverFn() router.DeliverFn {
 	return func(topic string, payload []byte, qos byte, retain bool, _ uint16) {
-		if c.state.Load() != int32(stateConnected) {
+		qEnqueue := func() {
 			if c.sess != nil && !c.sess.CleanSession {
 				c.sess.Enqueue(&session.Queued{
 					Topic:   topic,
@@ -631,20 +667,40 @@ func (c *Client) makeDeliverFn() router.DeliverFn {
 				})
 				metrics.OfflineQueuedMessages.Inc()
 			}
+		}
+
+		if c.state.Load() != int32(stateConnected) {
+			qEnqueue()
+			return
+		}
+
+		approx := protocol.ApproxClientOutboundPublishBytes(c.version, topic, len(payload), qos)
+		if c.peerMaxPacketSize > 0 && uint32(approx) > c.peerMaxPacketSize {
+			metrics.DroppedTotal.WithLabelValues("max_packet_size").Inc()
+			qEnqueue()
 			return
 		}
 
 		var pid uint16
 		if qos > 0 {
 			pid = c.sess.NextPacketID()
-			c.sess.AddOutFlight(&session.InFlight{
+			msg := &session.InFlight{
 				PacketID: pid,
 				Topic:    topic,
 				Payload:  payload,
 				QoS:      qos,
 				Retain:   retain,
 				SentAt:   time.Now(),
-			})
+			}
+			recvLim := uint16(0)
+			if c.version == protocol.V50 {
+				recvLim = c.peerRecvMax
+			}
+			if !c.sess.AddOutFlightLimited(msg, recvLim) {
+				metrics.DroppedTotal.WithLabelValues("receive_maximum").Inc()
+				qEnqueue()
+				return
+			}
 		}
 
 		var enc []byte
@@ -732,6 +788,27 @@ func (c *Client) enqueue(data []byte) {
 	}
 }
 
+func connackV5FromConfig(bc *config.BrokerConfig, topicAliasMax uint16) protocol.ConnackMQTT5Options {
+	rm := uint16(0)
+	if bc.ServerReceiveMaximum > 0 {
+		rm = uint16(bc.ServerReceiveMaximum)
+	}
+	mqos := byte(bc.ServerMaximumQoS)
+	if mqos > protocol.QoS2 {
+		mqos = protocol.QoS2
+	}
+	return protocol.ConnackMQTT5Options{
+		TopicAliasMax:                   topicAliasMax,
+		ReceiveMaximum:                  rm,
+		MaximumQoS:                      mqos,
+		MaxPacketSize:                   uint32(bc.MaxPacketSize),
+		RetainAvailable:                 bc.RetainAvailable,
+		WildcardSubscriptionAvailable:   bc.WildcardSubscriptionAvailable,
+		SubscriptionIDAvailable:         bc.SubscriptionIdentifierAvailable,
+		SharedSubscriptionAvailable:     bc.SharedSubscriptionAvailable,
+	}
+}
+
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 func (c *Client) cleanup() {
@@ -759,6 +836,8 @@ func (c *Client) cleanup() {
 				c.broker.router.UnsubscribeAll(cid)
 				c.broker.sessions.Delete(cid)
 				metrics.ActiveSessions.Dec()
+			} else if c.sess.PrepareDisconnectExpiry(time.Now()) {
+				c.broker.PurgePersistentSession(cid)
 			}
 			if c.sess.WillSet {
 				c.broker.router.Publish(

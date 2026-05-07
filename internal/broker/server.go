@@ -168,9 +168,10 @@ func (b *Broker) Start() error {
 	go b.apiPublishLoop()
 
 	// Background tasks
-	b.wg.Add(2)
+	b.wg.Add(3)
 	go b.maintenanceLoop()
 	go b.sysLoop()
+	go b.sessionExpirySweepLoop()
 
 	// Register this broker in Redis
 	go b.redis.SetBrokerMeta(context.Background(), b.id, map[string]interface{}{
@@ -276,6 +277,38 @@ func (b *Broker) unregister(clientID string) {
 	b.mu.Lock()
 	delete(b.clients, clientID)
 	b.mu.Unlock()
+}
+
+// PurgePersistentSession removes router subscriptions, deletes the session store entry,
+// and clears durable subscriptions for a client (MQTT v5 session expiry).
+func (b *Broker) PurgePersistentSession(clientID string) {
+	b.router.UnsubscribeAll(clientID)
+	b.sessions.Delete(clientID)
+	metrics.ActiveSessions.Dec()
+	go func() {
+		ctx := context.Background()
+		if err := b.pg.DeleteAllSubs(ctx, clientID); err != nil {
+			b.logger.Debug("delete all subs", zap.String("client", clientID), zap.Error(err))
+		}
+	}()
+}
+
+func (b *Broker) sessionExpirySweepLoop() {
+	defer b.wg.Done()
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case now := <-t.C:
+			b.sessions.Each(func(s *session.Session) {
+				if s.ShouldExpireDisconnected(now) {
+					b.PurgePersistentSession(s.ClientID)
+				}
+			})
+		}
+	}
 }
 
 func (b *Broker) takeover(clientID string) {

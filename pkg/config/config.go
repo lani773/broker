@@ -42,6 +42,14 @@ type BrokerConfig struct {
 	PingGrace            float64       // multiplier on keepalive before timeout (1.5)
 	// TopicAliasMax is the MQTT v5 Topic Alias Maximum sent in CONNACK (0 = disable client aliases).
 	TopicAliasMax int
+
+	// MQTT v5 CONNACK capability advertisement (success responses).
+	ServerReceiveMaximum            int  // 0x21; 0 = omit property (unlimited)
+	ServerMaximumQoS                int  // 0x24; typically 2 (property omitted at 2)
+	RetainAvailable                 bool // 0x25
+	WildcardSubscriptionAvailable   bool // 0x28
+	SubscriptionIdentifierAvailable bool // 0x29
+	SharedSubscriptionAvailable     bool // 0x2A
 }
 
 type APIConfig struct {
@@ -145,8 +153,14 @@ func Load() *Config {
 			WriteQueueSize:       envInt("WRITE_QUEUE_SIZE", 512),
 			MaxPacketSize:        envInt("MAX_PACKET_SIZE", 10*1024*1024),
 			SysInterval:          envDuration("SYS_INTERVAL", 10*time.Second),
-			PingGrace:            envFloat("PING_GRACE", 1.5),
-			TopicAliasMax:        envInt("MQTT_TOPIC_ALIAS_MAX", 64),
+			PingGrace:                       envFloat("PING_GRACE", 1.5),
+			TopicAliasMax:                   envInt("MQTT_TOPIC_ALIAS_MAX", 64),
+			ServerReceiveMaximum:            envInt("MQTT_SERVER_RECEIVE_MAXIMUM", 65535),
+			ServerMaximumQoS:                envInt("MQTT_SERVER_MAXIMUM_QOS", 2),
+			RetainAvailable:                 envBool("MQTT_RETAIN_AVAILABLE", true),
+			WildcardSubscriptionAvailable:   envBool("MQTT_WILDCARD_SUB_AVAILABLE", true),
+			SubscriptionIdentifierAvailable: envBool("MQTT_SUBSCRIPTION_ID_AVAILABLE", true),
+			SharedSubscriptionAvailable:     envBool("MQTT_SHARED_SUB_AVAILABLE", true),
 		},
 		API: APIConfig{
 			Addr:            env("API_ADDR", ":8080"),
@@ -254,6 +268,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Broker.TopicAliasMax < 0 || c.Broker.TopicAliasMax > 65535 {
 		return fmt.Errorf("MQTT_TOPIC_ALIAS_MAX must be between 0 and 65535")
+	}
+	if c.Broker.ServerMaximumQoS < 0 || c.Broker.ServerMaximumQoS > 2 {
+		return fmt.Errorf("MQTT_SERVER_MAXIMUM_QOS must be between 0 and 2")
+	}
+	if c.Broker.ServerReceiveMaximum != 0 && (c.Broker.ServerReceiveMaximum < 1 || c.Broker.ServerReceiveMaximum > 65535) {
+		return fmt.Errorf("MQTT_SERVER_RECEIVE_MAXIMUM must be 0 (omit) or 1..65535")
 	}
 	return nil
 }
